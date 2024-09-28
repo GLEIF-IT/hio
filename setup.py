@@ -86,7 +86,7 @@ setup(
                "structured concurrency",
         # eg: 'keyword1', 'keyword2', 'keyword3',
     ],
-    python_requires='>=3.12.2',
+    python_requires='>=3.11.6',
     install_requires=[
         'lmdb>=1.4.1',
         'msgpack>=1.0.8',
