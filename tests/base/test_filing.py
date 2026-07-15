@@ -363,6 +363,81 @@ def test_filing():
     """Done Test"""
 
 
+def test_filer_temp_root_cleanup(tmp_path, monkeypatch):
+    """Test cleanup of temporary roots and persistent resources."""
+    monkeypatch.setattr(filing.Filer, "TempHeadDir", str(tmp_path))
+
+    # Directory-backed temporary Filer removes its complete owned root
+    filer = filing.Filer(name="resource", base="base", temp=True)
+    tempDirPath = filer._tempDirPath
+
+    assert tempDirPath
+    assert os.path.dirname(tempDirPath) == str(tmp_path)
+    assert os.path.exists(tempDirPath)
+    assert os.path.exists(filer.path)
+
+    filer.close(clear=True)
+
+    assert not os.path.exists(tempDirPath)
+
+    # File-backed temporary Filer removes its complete owned root
+    filer = filing.Filer(name="resource", base="base", temp=True, filed=True)
+    tempDirPath = filer._tempDirPath
+
+    assert tempDirPath
+    assert os.path.dirname(tempDirPath) == str(tmp_path)
+    assert os.path.exists(tempDirPath)
+    assert os.path.isfile(filer.path)
+
+    filer.close(clear=True)
+
+    assert not os.path.exists(tempDirPath)
+
+    # Reopen replaces the resource while preserving the owned root and siblings
+    filer = filing.Filer(name="resource", temp=True)
+    tempDirPath = filer._tempDirPath
+    resourcePath = filer.path
+    markerPath = os.path.join(resourcePath, "marker")
+    siblingPath = os.path.join(tempDirPath, "sibling")
+    os.makedirs(markerPath)
+    os.makedirs(siblingPath)
+
+    filer.reopen()
+
+    assert filer._tempDirPath == tempDirPath
+    assert filer.path == resourcePath
+    assert os.path.exists(tempDirPath)
+    assert os.path.exists(resourcePath)
+    assert not os.path.exists(markerPath)
+    assert os.path.exists(siblingPath)
+
+    filer.close(clear=True)
+    assert not os.path.exists(tempDirPath)
+
+    # Switching to persistent storage clears temporary ownership, and persistent
+    # cleanup removes only the managed resource path
+    filer = filing.Filer(name="resource", base="base", temp=True)
+    tempDirPath = filer._tempDirPath
+    headDirPath = os.path.join(tmp_path, "persistent")
+
+    filer.reopen(temp=False, headDirPath=headDirPath)
+
+    resourcePath = filer.path
+    siblingPath = os.path.join(os.path.dirname(resourcePath), "sibling")
+    os.makedirs(siblingPath)
+
+    assert not os.path.exists(tempDirPath)
+    assert filer._tempDirPath is None
+    assert os.path.exists(resourcePath)
+    assert os.path.exists(siblingPath)
+
+    filer.close(clear=True)
+
+    assert not os.path.exists(resourcePath)
+    assert os.path.exists(siblingPath)
+    assert os.path.exists(tmp_path)
+
+
 def test_filer_doer():
     """
     Test FilerDoer

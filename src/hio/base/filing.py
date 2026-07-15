@@ -56,6 +56,7 @@ class Filer(hioing.Mixin):
 
     Hidden:
         _name (str): unique name for .name property
+        _tempDirPath (str | None): owned temporary root directory path
 
 
     File/Directory Creation Mode Notes::
@@ -141,6 +142,7 @@ class Filer(hioing.Mixin):
         self.headDirPath = headDirPath if headDirPath is not None else self.HeadDirPath
         self.perm = perm if perm is not None else self.Perm
         self.path = None
+        self._tempDirPath = None
         self.filed = True if filed else False
         self.extensioned = True if extensioned else False
         self.mode = mode if mode is not None else self.Mode
@@ -210,6 +212,9 @@ class Filer(hioing.Mixin):
             self.fext = fext
 
         if not self.path or not os.path.exists(self.path) or not reuse:
+            if self._tempDirPath:
+                self._clearPath(clearTempDir=not self.temp)
+
             self.path, self.file = self.remake(name=self.name,
                                                base=self.base,
                                                temp=self.temp,
@@ -293,9 +298,11 @@ class Filer(hioing.Mixin):
             raise hioing.FilerError(f"Not relative {name=} path.")
 
         if temp:
-            headDirPath = tempfile.mkdtemp(prefix=self.TempPrefix,
-                                           suffix=self.TempSuffix,
-                                           dir=self.TempHeadDir)
+            if not self._tempDirPath:
+                self._tempDirPath = tempfile.mkdtemp(prefix=self.TempPrefix,
+                                                     suffix=self.TempSuffix,
+                                                     dir=self.TempHeadDir)
+            headDirPath = self._tempDirPath
 
             path = os.path.abspath(
                                 os.path.join(headDirPath,
@@ -500,9 +507,17 @@ class Filer(hioing.Mixin):
         return not self.opened  # True means closed False means still opened
 
 
-    def _clearPath(self):
+    def _clearPath(self, clearTempDir=True):
         """Remove directory/file at end of .path
         """
+        if clearTempDir and self._tempDirPath:
+            if os.path.exists(self._tempDirPath):
+                shutil.rmtree(self._tempDirPath)
+            self._tempDirPath = None
+            if self.file:
+                self.file = None
+            return
+
         if self.path and os.path.exists(self.path):
             if os.path.isfile(self.path):  # self.path points to File instance
                 os.remove(self.path)  # rm only file at end of path
@@ -510,14 +525,14 @@ class Filer(hioing.Mixin):
                 if self.file:  # self.file is File instance
                     self.file = None  #
 
-                if self.temp:  # remove trailing dir of path as well
+                if self.temp and clearTempDir:  # remove trailing dir of path as well
                     head, tail = os.path.split(self.path)
                     shutil.rmtree(head)  # rm dir head as root and all below head
 
             elif self.extensioned:  # path end has file extension
                 os.remove(self.path)  # rm only extensioned end of path
 
-                if self.temp:  # remove trailing dir of path as well
+                if self.temp and clearTempDir:  # remove trailing dir of path as well
                     head, tail = os.path.split(self.path)
                     shutil.rmtree(head)  # rm dir head as root and all below head
 
