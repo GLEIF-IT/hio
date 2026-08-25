@@ -6,7 +6,7 @@ GLEIF maintenance distribution
 
 The GLEIF v0.6.20 release line is published to PyPI as ``gleif_hio`` while
 continuing to provide the original ``hio`` Python import package. Install this
-release candidate with ``pip install gleif_hio==0.6.20rc1`` and continue to use
+release candidate with ``pip install gleif_hio==0.6.20rc2`` and continue to use
 ``import hio`` in application code.
 
 Do not install ``gleif_hio`` alongside the upstream ``hio`` distribution.
