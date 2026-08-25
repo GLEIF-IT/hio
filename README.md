@@ -1,6 +1,18 @@
 Introduction to HIO
 ***********************
 
+GLEIF maintenance distribution
+==============================
+
+The GLEIF v0.6.20 release line is published to PyPI as ``gleif_hio`` while
+continuing to provide the original ``hio`` Python import package. Install this
+release candidate with ``pip install gleif_hio==0.6.20rc1`` and continue to use
+``import hio`` in application code.
+
+Do not install ``gleif_hio`` alongside the upstream ``hio`` distribution.
+Both distributions provide the same ``hio`` import package and are intended to
+be mutually exclusive alternatives.
+
 Weightless hierarchical asynchronous coroutines and I/O in Python.
 
 Rich Flow Based Programming Hierarchical Structured Concurrency with Asynchronous IO
@@ -74,4 +86,3 @@ Version 0.3.4
   The TCP IO  Client and Server classes are implemented. Includes support for TLS
 
   TCP ServerDoer, EchoServerDoer, and ClientDoer classes are implemented as examples
-

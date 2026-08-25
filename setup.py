@@ -1,16 +1,11 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
 """
-$ python setup.py register sdist upload
+Build and verify release artifacts before publishing:
 
-First Time register project on pypi
-https://pypi.org/manage/projects/
-
-
-More secure to use twine to upload
-$ pip3 install twine
-$ python setup.py sdist
-$ twine upload dist/hio-0.0.1.tar.gz
+$ python -m build
+$ python -m twine check dist/*
+$ python -m twine upload dist/*
 
 
 Update sphinx /docs
@@ -43,16 +38,18 @@ from setuptools import setup
 
 
 setup(
-    name='hio',
-    version='0.6.19',  #  also change in src/hio/__init__.py
+    name='gleif_hio',
+    version='0.6.20rc1',  # also change in src/hio/__init__.py
     license='Apache Software License 2.0',
-    description='Hierarchical Concurrency with Async IO',
-    long_description=("HIO Hierarchical Concurrency and Asynchronous IO Library. "
-                      "Rich structured contextual concurrrent coroutines with"
-                      " asynchrounous IO modules."),
+    description='GLEIF-maintained HIO release for KERI infrastructure',
+    long_description=("GLEIF-maintained release of the HIO hierarchical "
+                      "concurrency and asynchronous I/O library. The PyPI "
+                      "distribution is named gleif_hio and intentionally "
+                      "continues to provide the hio import package."),
+    long_description_content_type='text/plain',
     author='Samuel M. Smith',
     author_email='smith.samuel.m@gmail.com',
-    url='https://github.com/ioflo/hio',
+    url='https://github.com/GLEIF-IT/hio',
     packages=find_packages('src'),
     package_dir={'': 'src'},
     py_modules=[splitext(basename(path))[0] for path in glob('src/*.py')],
@@ -77,8 +74,9 @@ setup(
     ],
     project_urls={
         'Documentation': 'https://hio.readthedocs.io/',
-        'Changelog': 'https://hio.readthedocs.io/en/latest/changelog.html',
-        'Issue Tracker': 'https://github.com/ProSapien/hio/issues',
+        'Source': 'https://github.com/GLEIF-IT/hio',
+        'Issue Tracker': 'https://github.com/GLEIF-IT/hio/issues',
+        'Upstream': 'https://github.com/ioflo/hio',
     },
     keywords=[ "hierarchical concurrency",
                "async io",
