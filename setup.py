@@ -39,7 +39,7 @@ from setuptools import setup
 
 setup(
     name='gleif_hio',
-    version='0.6.20rc1',  # also change in src/hio/__init__.py
+    version='0.6.20rc2',  # also change in src/hio/__init__.py
     license='Apache Software License 2.0',
     description='GLEIF-maintained HIO release for KERI infrastructure',
     long_description=("GLEIF-maintained release of the HIO hierarchical "
@@ -84,7 +84,7 @@ setup(
                "structured concurrency",
         # eg: 'keyword1', 'keyword2', 'keyword3',
     ],
-    python_requires='>=3.12.6',
+    python_requires='>=3.12.2',
     install_requires=[
         'lmdb>=1.6.2',
         'msgpack>=1.1.0',
