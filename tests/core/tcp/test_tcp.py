@@ -913,6 +913,84 @@ def test_tls_receive_retries_typed_want(endpointCls):
 
 
 @pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
+def test_tls_send_retries_typed_want(endpointCls):
+    """A typed TLS WANT condition preserves output for a later cycle."""
+    cs = Mock(spec=ssl.SSLSocket)
+    cs.send.side_effect = ssl.SSLWantWriteError(
+        ssl.SSL_ERROR_WANT_WRITE, "want write")
+    endpoint = makeTlsEndpoint(endpointCls, cs)
+    endpoint.tx(b"pending")
+
+    endpoint.serviceSends()
+
+    assert bytes(endpoint.txbs) == b"pending"
+    assert endpoint.cutoff is False
+    assert endpoint.txCutoff is False
+    assert endpoint.error is None
+
+
+@pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
+def test_tls_send_retains_broken_pipe(endpointCls):
+    """A broken write preserves receive service, cause, and unsent bytes."""
+    cs = Mock(spec=ssl.SSLSocket)
+    failure = BrokenPipeError(errno.EPIPE, "broken pipe")
+    cs.send.side_effect = failure
+    endpoint = makeTlsEndpoint(endpointCls, cs)
+    endpoint.tx(b"unsent")
+
+    endpoint.serviceSends()
+
+    assert endpoint.cutoff is False
+    assert endpoint.txCutoff is True
+    assert endpoint.error is failure
+    assert bytes(endpoint.txbs) == b"unsent"
+    with pytest.raises(hioing.TransmitClosedError) as excinfo:
+        endpoint.tx(b"late")
+    assert excinfo.value.__cause__ is failure
+
+
+@pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
+def test_tls_send_force_closes_fatal_ssl_failure(endpointCls):
+    """A fatal TLS write failure closes both directions and retains output."""
+    cs = Mock(spec=ssl.SSLSocket)
+    failure = ssl.SSLSyscallError(ssl.SSL_ERROR_SYSCALL, "fatal send")
+    cs.send.side_effect = failure
+    endpoint = makeTlsEndpoint(endpointCls, cs)
+    endpoint.tx(b"unsent")
+
+    with pytest.raises(ssl.SSLSyscallError) as excinfo:
+        endpoint.serviceSends()
+
+    assert excinfo.value is failure
+    assert endpoint.cutoff is True
+    assert endpoint.txCutoff is True
+    assert endpoint.error is failure
+    assert bytes(endpoint.txbs) == b"unsent"
+    assert endpoint.cs is None
+    cs.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
+def test_tls_send_force_closes_connection_reset(endpointCls):
+    """A connection reset makes both TLS directions unusable."""
+    cs = Mock(spec=ssl.SSLSocket)
+    failure = ConnectionResetError(errno.ECONNRESET, "reset")
+    cs.send.side_effect = failure
+    endpoint = makeTlsEndpoint(endpointCls, cs)
+    endpoint.tx(b"unsent")
+
+    with pytest.raises(ConnectionResetError) as excinfo:
+        endpoint.serviceSends()
+
+    assert excinfo.value is failure
+    assert endpoint.cutoff is True
+    assert endpoint.txCutoff is True
+    assert endpoint.error is failure
+    assert bytes(endpoint.txbs) == b"unsent"
+    assert endpoint.cs is None
+
+
+@pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
 def test_tls_clean_close_ends_only_receive(endpointCls):
     """A peer close_notify cleanly ends only the receive direction."""
     cs = Mock(spec=ssl.SSLSocket)
