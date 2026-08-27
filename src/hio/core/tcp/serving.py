@@ -1066,24 +1066,37 @@ class RemoterTls(Remoter):
         """
         try:
             result = self.cs.send(data) #result is number of bytes sent
-        except OSError as ex:  # ssl.SSLError is a subtype of OSError
-            # ex.args[0] == ex.errno for better compat
-            # the value of a given errno.XXXXX may be different on each os
-            if ex.args[0] in (ssl.SSL_ERROR_WANT_READ, ssl.SSL_ERROR_WANT_WRITE):
-                result = 0  # blocked try again
-            elif ex.args[0] in (errno.ECONNRESET,
-                                errno.ENETRESET,
-                                errno.ENETUNREACH,
-                                errno.EHOSTUNREACH,
-                                errno.ENETDOWN,
-                                errno.EHOSTDOWN,
-                                errno.ETIMEDOUT,
-                                errno.ECONNREFUSED,
-                                ssl.SSLEOFError):
-                self.cutoff = True
+        except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+            result = 0  # nonblocking TLS operation must retry later
+        except BrokenPipeError as ex:
+            self.txCutoff = True  # send failed but receive may still drain
+            self.error = ex
+            result = 0
+        except (ssl.SSLEOFError, ssl.SSLSyscallError) as ex:  # TLS unusable
+            self.cutoff = True
+            self.txCutoff = True
+            self.error = ex
+            self.close()
+            raise
+        except OSError as ex:
+            if ex.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                result = 0  # nonblocking socket must retry later
+            elif ex.errno in (errno.ECONNRESET,
+                              errno.ENETRESET,
+                              errno.ENETUNREACH,
+                              errno.EHOSTUNREACH,
+                              errno.ENETDOWN,
+                              errno.EHOSTDOWN,
+                              errno.ETIMEDOUT,
+                              errno.ECONNREFUSED):
+                self.cutoff = True  # connection-wide failure closes TLS
                 self.txCutoff = True
-                result = 0
+                self.error = ex
+                self.close()
+                raise
             else:
+                self.txCutoff = True  # terminal send failure preserves input
+                self.error = ex
                 raise
 
         if result:
