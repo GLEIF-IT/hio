@@ -859,6 +859,10 @@ def closeTlsPair(server, client, remoter):
 
 def makeTlsEndpoint(endpointCls, cs):
     """Make a TLS endpoint around a deterministic socket fake."""
+    cs.pending.return_value = 0
+    if cs.recv.side_effect is None:
+        cs.recv.side_effect = ssl.SSLWantReadError(
+            ssl.SSL_ERROR_WANT_READ, "want read")
     context = Mock(spec=ssl.SSLContext)
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
@@ -1041,6 +1045,59 @@ def test_tls_local_close_recurs_and_rejects_late_writes(version,
         closeTlsPair(server, client, remoter)
 
 
+@pytest.mark.parametrize(
+    "version",
+    (ssl.TLSVersion.TLSv1_3, ssl.TLSVersion.TLSv1_2),
+)
+@pytest.mark.parametrize("receiverName", ("client", "remoter"))
+def test_tls_local_close_preserves_real_pending_plaintext(version,
+                                                           receiverName):
+    """Real recurrent close retains plaintext already buffered by TLS."""
+    server, client, remoter = openTlsPair(version)
+    receiver = client if receiverName == "client" else remoter
+    sender = remoter if receiverName == "client" else client
+    message = b"plaintext pending before local close" * 32
+
+    try:
+        sender.tx(message)
+        for _ in range(1000):
+            sender.serviceSends()
+            if not sender.txbs:
+                break
+            time.sleep(0.001)
+        assert not sender.txbs
+
+        first = None
+        for _ in range(1000):
+            try:
+                first = receiver.cs.recv(1)  # leave the rest buffered in TLS
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                time.sleep(0.001)
+                continue
+            break
+        assert first == message[:1]
+        receiver.rxbs.extend(first)
+        assert receiver.cs.pending() > 0
+        assert receiver.serviceClose() is False
+
+        clientDone = False
+        remoterDone = False
+        for _ in range(1000):
+            if not clientDone:
+                clientDone = client.serviceClose()
+            if not remoterDone:
+                remoterDone = remoter.serviceClose()
+            if clientDone and remoterDone:
+                break
+            time.sleep(0.001)
+
+        assert clientDone is True
+        assert remoterDone is True
+        assert bytes(receiver.rxbs) == message
+    finally:
+        closeTlsPair(server, client, remoter)
+
+
 @pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
 def test_tls_close_retries_want_and_drains_pending_plaintext(endpointCls):
     """Recurrent close preserves pending plaintext before retrying unwrap."""
@@ -1051,17 +1108,18 @@ def test_tls_close_retries_want_and_drains_pending_plaintext(endpointCls):
         ssl.SSLWantReadError(ssl.SSL_ERROR_WANT_READ, "want read"),
         raw,
     ]
-    cs.pending.side_effect = [7, 0]
+    cs.pending.side_effect = [7, 0, 0]
     cs.recv.side_effect = [
         b"pending",
+        ssl.SSLWantReadError(ssl.SSL_ERROR_WANT_READ, "want read"),
         ssl.SSLWantReadError(ssl.SSL_ERROR_WANT_READ, "want read"),
     ]
     endpoint = makeTlsEndpoint(endpointCls, cs)
 
     assert endpoint.serviceClose() is False
     assert endpoint.txCutoff is True
-    assert endpoint.serviceClose() is False
     assert bytes(endpoint.rxbs) == b"pending"
+    assert endpoint.serviceClose() is False
     assert endpoint.serviceClose() is True
     assert endpoint.serviceClose() is True
     assert endpoint.cutoff is True
@@ -1191,17 +1249,107 @@ def test_tls_close_before_handshake_force_closes(endpointCls):
 
 
 @pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
-def test_tls_clean_close_ends_only_receive(endpointCls):
-    """A peer close_notify cleanly ends only the receive direction."""
+@pytest.mark.parametrize("version, txCutoff", (("TLSv1.3", False),
+                                                ("TLSv1.2", True)))
+def test_tls_clean_close_is_version_aware(endpointCls, version, txCutoff):
+    """Clean peer close follows the negotiated TLS version policy."""
     cs = Mock(spec=ssl.SSLSocket)
+    raw = Mock(spec=socket.socket)
+    cs.version.return_value = version
+    cs.recv.side_effect = ssl.SSLZeroReturnError(
+        ssl.SSL_ERROR_ZERO_RETURN, "close notify")
+    cs.unwrap.return_value = raw
+    endpoint = makeTlsEndpoint(endpointCls, cs)
+    endpoint.tx(b"pending")
+
+    assert endpoint.receive() == b""
+    assert endpoint.cutoff is True
+    assert endpoint.txCutoff is txCutoff
+    assert bytes(endpoint.txbs) == b"pending"
+    if version == "TLSv1.2":
+        assert isinstance(endpoint.error, hioing.TransmitClosedError)
+        assert version in str(endpoint.error)
+        assert "7 unsent bytes" in str(endpoint.error)
+        assert endpoint.cs is None
+        cs.unwrap.assert_called_once_with()
+        raw.close.assert_called_once_with()
+    else:
+        assert endpoint.error is None
+        assert endpoint.cs is cs
+        cs.unwrap.assert_not_called()
+        raw.close.assert_not_called()
+
+
+@pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
+def test_tls_clean_close_requires_negotiated_version(endpointCls):
+    """Missing negotiated version fails closed after clean TLS EOF."""
+    cs = Mock(spec=ssl.SSLSocket)
+    cs.version.return_value = None
     cs.recv.side_effect = ssl.SSLZeroReturnError(
         ssl.SSL_ERROR_ZERO_RETURN, "close notify")
     endpoint = makeTlsEndpoint(endpointCls, cs)
 
-    assert endpoint.receive() == b""
+    with pytest.raises(hioing.VersionError,
+                       match="negotiated TLS version") as excinfo:
+        endpoint.receive()
+
+    assert endpoint.error is excinfo.value
     assert endpoint.cutoff is True
-    assert endpoint.txCutoff is False
-    assert endpoint.error is None
+    assert endpoint.txCutoff is True
+    assert endpoint.cs is None
+
+
+@pytest.mark.parametrize(
+    "version, txCutoff",
+    ((ssl.TLSVersion.TLSv1_3, False),
+     (ssl.TLSVersion.TLSv1_2, True)),
+)
+@pytest.mark.parametrize("receiverName", ("client", "remoter"))
+def test_tls_peer_close_obeys_negotiated_version(version,
+                                                  txCutoff,
+                                                  receiverName):
+    """Peer close preserves TLS 1.3 output and rejects TLS 1.2 output."""
+    server, client, remoter = openTlsPair(version)
+    receiver = client if receiverName == "client" else remoter
+    closer = remoter if receiverName == "client" else client
+    response = b"accepted response"
+
+    try:
+        receiver.tx(response)
+        with pytest.raises((ssl.SSLWantReadError, ssl.SSLWantWriteError)):
+            closer.cs.unwrap()
+
+        for _ in range(1000):
+            receiver.serviceReceives()
+            if receiver.cutoff:
+                break
+            time.sleep(0.001)
+        assert receiver.cutoff is True
+        assert receiver.txCutoff is txCutoff
+
+        if version == ssl.TLSVersion.TLSv1_3:
+            receiver.serviceSends()
+            assert not receiver.txbs
+            received = None
+            for _ in range(1000):
+                received = closer.receive()
+                if received:
+                    break
+                time.sleep(0.001)
+            assert received == response
+        else:
+            assert bytes(receiver.txbs) == response
+            assert isinstance(receiver.error, hioing.TransmitClosedError)
+            assert "TLSv1.2" in str(receiver.error)
+            assert "{0} unsent bytes".format(len(response)) in str(
+                receiver.error)
+            for _ in range(1000):
+                if receiver.serviceClose():
+                    break
+                time.sleep(0.001)
+            assert receiver.cs is None
+    finally:
+        closeTlsPair(server, client, remoter)
 
 
 @pytest.mark.parametrize("receiverName", ("client", "remoter"))
