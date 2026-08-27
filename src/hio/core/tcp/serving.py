@@ -20,7 +20,7 @@ import ssl
 from collections import deque
 from contextlib import contextmanager
 
-from ... import help
+from ... import help, hioing
 from ...base import tyming, doing
 from .. import coring
 
@@ -668,6 +668,7 @@ class Remoter(tyming.Tymee):
         self.tymer = tyming.Tymer(tymth=self.tymth, duration=self.tymeout)
         self.cutoff = False # True when receive direction is closed
         self.txCutoff = False  # True when send direction is closed
+        self.error = None  # retained terminal transport exception if any
         self.refreshable = refreshable
         self.bs = bs
         self.txbs = bytearray()  # bytearray of data to send
@@ -767,6 +768,7 @@ class Remoter(tyming.Tymee):
                                 errno.ECONNREFUSED):
                 self.cutoff = True
                 self.txCutoff = True
+                self.error = ex
                 return bytes()  # data empty
             else:  # unexpected error
                 logger.error("Unexpected error on receive on %s.\n%s\n", self.cs.getpeername(), ex)
@@ -832,6 +834,7 @@ class Remoter(tyming.Tymee):
                 if self.txCutoff:
                     raise
                 self.txCutoff = True
+                self.error = ex
                 count = 0
             elif ex.args[0] in (errno.ECONNRESET,
                                 errno.ENETRESET,
@@ -843,6 +846,7 @@ class Remoter(tyming.Tymee):
                                 errno.ECONNREFUSED):
                 self.cutoff = True
                 self.txCutoff = True
+                self.error = ex
                 count = 0
             else:
                 raise
@@ -861,6 +865,13 @@ class Remoter(tyming.Tymee):
         '''
         Queue data onto .txbs
         '''
+        if self.txCutoff:  # reject output that can no longer be sent
+            ex = hioing.TransmitClosedError(
+                "connection send direction is closed")
+            if self.error is None:
+                self.error = ex
+                raise ex
+            raise ex from self.error  # preserve originating transport failure
         self.txbs.extend(data)
 
 

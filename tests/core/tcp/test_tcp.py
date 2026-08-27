@@ -1868,9 +1868,30 @@ def test_remoter_sets_tx_cutoff_after_broken_send():
         assert remoter.cutoff is False
         assert remoter.txCutoff is True
         assert bytes(remoter.txbs) == message
+        assert isinstance(remoter.error, BrokenPipeError)
+
+        with pytest.raises(hioing.TransmitClosedError) as excinfo:
+            remoter.tx(b"late output")
+        assert excinfo.value.__cause__ is remoter.error
+        assert bytes(remoter.txbs) == message
     finally:
         remoter.close()
         peer.close()
+
+
+def test_remoter_retains_terminal_receive_failure():
+    """A terminal receive failure records why both directions closed."""
+    cs = Mock(spec=socket.socket)
+    failure = ConnectionResetError(errno.ECONNRESET, "reset")
+    cs.recv.side_effect = failure
+    remoter = tcp.Remoter(ha=("127.0.0.1", 6101),
+                         ca=("127.0.0.1", 6102),
+                         cs=cs)
+
+    assert remoter.receive() == b""
+    assert remoter.cutoff is True
+    assert remoter.txCutoff is True
+    assert remoter.error is failure
 
 
 if __name__ == "__main__":
