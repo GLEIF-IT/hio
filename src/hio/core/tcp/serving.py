@@ -991,8 +991,25 @@ class RemoterTls(Remoter):
 
 
     def _receiveClosed(self):
-        """Record a clean TLS close of the receive direction."""
-        self.cutoff = True  # close_notify authenticates peer receive EOF
+        """Record a clean TLS receive close using its negotiated version."""
+        version = self.cs.version()
+        self.cutoff = True  # close_notify always ends the receive direction
+        # TLS 1.3 leaves send open; TLS 1.2 requires a reciprocal close
+        if version == "TLSv1.2":
+            remaining = len(self.txbs)  # preserve exact stranded output count
+            self.txCutoff = True  # TLS 1.2 forbids data after close_notify
+            if remaining:  # report output stranded by the mandatory close
+                self.error = hioing.TransmitClosedError(
+                    "TLSv1.2 peer close_notify requires reciprocal close "
+                    "with {0} unsent bytes".format(remaining))
+            if not self._closing:
+                self.serviceClose()  # answer peer close in this recurrence
+        elif version != "TLSv1.3":
+            self.txCutoff = True  # unknown version cannot safely send later
+            self.error = hioing.VersionError(
+                "unsupported negotiated TLS version '{0}'".format(version))
+            self.close()
+            raise self.error
         return bytes()
 
 
@@ -1049,8 +1066,8 @@ class RemoterTls(Remoter):
                 return False  # accepted output must drain before close_notify
             self._closing = True  # latch before first unwrap attempt
             self.txCutoff = True  # reject application writes during close
-
-        if self._closeWantRead:
+            self._serviceCloseReceives()  # drain data racing local close
+        elif self._closeWantRead:
             self._serviceCloseReceives()  # drain data before retrying unwrap
 
         try:
