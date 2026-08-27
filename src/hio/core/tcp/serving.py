@@ -708,10 +708,7 @@ class Remoter(tyming.Tymee):
         Shutdown send on connected socket .cs
         """
         if self.cs:
-            try:
-                self.shutdown(how=socket.SHUT_WR)  # shutdown socket
-            except OSError as ex:
-                pass
+            return self.shutdown(how=socket.SHUT_WR)  # shutdown socket
 
 
     def shutdownReceive(self):
@@ -719,10 +716,7 @@ class Remoter(tyming.Tymee):
         Shutdown receive on connected socket .cs
         """
         if self.cs:
-            try:
-                self.shutdown(how=socket.SHUT_RD)  # shutdown socket
-            except OSError as ex:
-                pass
+            return self.shutdown(how=socket.SHUT_RD)  # shutdown socket
 
 
     def serviceClose(self):
@@ -955,6 +949,8 @@ class RemoterTls(Remoter):
 
         self.connected = False  # True once ssl handshake completed
         self.aborted = False # True if client aborts TLS handshake prematurely
+        self._closing = False  # True after recurrent TLS close starts
+        self._closeWantRead = False  # True when unwrap needs read service
 
         self.context = initServerContext(context=context,
                                     version=version,
@@ -964,6 +960,11 @@ class RemoterTls(Remoter):
                                     cafilepath=cafilepath
                                   )
         self.wrap()
+
+
+    def shutdown(self, how=socket.SHUT_RDWR):
+        """Start recurrent TLS shutdown without raw socket shutdown."""
+        return self.serviceClose()  # TLS close is not a raw half-close
 
 
     def close(self):
@@ -981,6 +982,8 @@ class RemoterTls(Remoter):
         """
         Wrap socket .cs in ssl context
         """
+        self._closing = False  # new TLS session resets close progress
+        self._closeWantRead = False
         self.cs = self.context.wrap_socket(self.cs,
                                            server_side=True,
                                            do_handshake_on_connect=False,
@@ -991,6 +994,110 @@ class RemoterTls(Remoter):
         """Record a clean TLS close of the receive direction."""
         self.cutoff = True  # close_notify authenticates peer receive EOF
         return bytes()
+
+
+    def _serviceCloseReceives(self):
+        """Preserve TLS plaintext while unwrap waits for peer input."""
+        if not self.cs or self.cutoff:
+            return
+
+        try:
+            remaining = self.cs.pending()  # plaintext buffered by TLS
+        except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+            return  # nonblocking TLS operation must retry later
+        except OSError as ex:
+            self.cutoff = True
+            self.txCutoff = True
+            self.error = ex
+            self.close()  # invalid TLS buffer state is terminal
+            raise
+        if not remaining:
+            self.serviceReceiveOnce()  # preserve data racing close_notify
+            return
+
+        while remaining > 0 and self.cs and not self.cutoff:
+            data = self.receive()
+            if not data:
+                break
+            self.rxbs.extend(data)
+            remaining -= len(data)
+
+
+    def serviceClose(self):
+        """
+        Service recurrent TLS close_notify exchange.
+        Returns True when closed, False when service must retry.
+        """
+        if not self.cs:
+            return True
+
+        if not self.connected:
+            self.cutoff = True
+            self.txCutoff = True
+            self.close()  # incomplete handshake has no TLS close to exchange
+            return True
+
+        if self.error is not None and not isinstance(
+                self.error, hioing.TransmitClosedError):
+            self.cutoff = True
+            self.txCutoff = True
+            self.close()  # fatal transport state must bypass unwrap
+            return True
+
+        if not self._closing:
+            if self.txbs and not self.txCutoff:
+                return False  # accepted output must drain before close_notify
+            self._closing = True  # latch before first unwrap attempt
+            self.txCutoff = True  # reject application writes during close
+
+        if self._closeWantRead:
+            self._serviceCloseReceives()  # drain data before retrying unwrap
+
+        try:
+            raw = self.cs.unwrap()
+        except ssl.SSLWantReadError:
+            self._closeWantRead = True
+            self._serviceCloseReceives()  # preserve pending or racing data
+            return False
+        except ssl.SSLWantWriteError:
+            self._closeWantRead = False
+            return False  # local close_notify needs write readiness
+        except ssl.SSLZeroReturnError:
+            self._receiveClosed()  # peer close_notify completed receive side
+            self._closeWantRead = True
+            return False
+        except (ssl.SSLEOFError, ssl.SSLSyscallError) as ex:
+            self.cutoff = True
+            self.txCutoff = True
+            self.error = ex
+            self.close()  # failed TLS transport cannot continue unwrap
+            raise
+        except ssl.SSLError as ex:
+            self.cutoff = True
+            self.txCutoff = True
+            self.error = ex
+            self.close()  # SSL_ERROR_SSL is terminal during shutdown
+            raise
+        except OSError as ex:
+            if ex.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return False  # nonblocking socket must retry later
+            self.cutoff = True
+            self.txCutoff = True
+            self.error = ex
+            self.close()  # terminal socket error bypasses later unwrap
+            raise
+
+        self.cs = None  # never expose unwrapped socket to application I/O
+        self.connected = False
+        self.cutoff = True
+        self.txCutoff = True
+        self._closeWantRead = False
+        try:
+            raw.close()  # release raw socket returned by successful unwrap
+        except OSError as ex:
+            self.error = ex
+            raise
+        return True
 
 
     def handshake(self):

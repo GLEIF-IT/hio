@@ -1003,6 +1003,193 @@ def test_tls_force_close_does_not_raw_shutdown(endpointCls):
     cs.close.assert_called_once_with()
 
 
+@pytest.mark.parametrize(
+    "version",
+    (ssl.TLSVersion.TLSv1_3, ssl.TLSVersion.TLSv1_2),
+)
+@pytest.mark.parametrize("initiatorName", ("client", "remoter"))
+def test_tls_local_close_recurs_and_rejects_late_writes(version,
+                                                         initiatorName):
+    """Real TLS close retries and admits no later application output."""
+    server, client, remoter = openTlsPair(version)
+    initiator = client if initiatorName == "client" else remoter
+
+    try:
+        assert initiator.serviceClose() is False
+        with pytest.raises(hioing.TransmitClosedError, match="closed"):
+            initiator.tx(b"late output")
+        assert not initiator.txbs
+
+        clientDone = False
+        remoterDone = False
+        for _ in range(1000):
+            client.serviceReceives()
+            remoter.serviceReceives()
+            if not clientDone:
+                clientDone = client.serviceClose()
+            if not remoterDone:
+                remoterDone = remoter.serviceClose()
+            if clientDone and remoterDone:
+                break
+            time.sleep(0.001)
+
+        assert clientDone is True
+        assert remoterDone is True
+        assert client.accepted is False
+        assert client.opened is False
+    finally:
+        closeTlsPair(server, client, remoter)
+
+
+@pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
+def test_tls_close_retries_want_and_drains_pending_plaintext(endpointCls):
+    """Recurrent close preserves pending plaintext before retrying unwrap."""
+    cs = Mock(spec=ssl.SSLSocket)
+    raw = Mock(spec=socket.socket)
+    cs.unwrap.side_effect = [
+        ssl.SSLWantWriteError(ssl.SSL_ERROR_WANT_WRITE, "want write"),
+        ssl.SSLWantReadError(ssl.SSL_ERROR_WANT_READ, "want read"),
+        raw,
+    ]
+    cs.pending.side_effect = [7, 0]
+    cs.recv.side_effect = [
+        b"pending",
+        ssl.SSLWantReadError(ssl.SSL_ERROR_WANT_READ, "want read"),
+    ]
+    endpoint = makeTlsEndpoint(endpointCls, cs)
+
+    assert endpoint.serviceClose() is False
+    assert endpoint.txCutoff is True
+    assert endpoint.serviceClose() is False
+    assert bytes(endpoint.rxbs) == b"pending"
+    assert endpoint.serviceClose() is True
+    assert endpoint.serviceClose() is True
+    assert endpoint.cutoff is True
+    assert endpoint.cs is None
+    assert endpoint.connected is False
+    raw.close.assert_called_once_with()
+    cs.shutdown.assert_not_called()
+
+
+@pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
+@pytest.mark.parametrize("methodName",
+                         ("shutdown", "shutdownSend", "shutdownReceive"))
+def test_tls_shutdown_starts_recurrent_close(endpointCls, methodName):
+    """TLS shutdown APIs start close_notify without raw socket shutdown."""
+    cs = Mock(spec=ssl.SSLSocket)
+    cs.unwrap.side_effect = ssl.SSLWantWriteError(
+        ssl.SSL_ERROR_WANT_WRITE, "want write")
+    endpoint = makeTlsEndpoint(endpointCls, cs)
+
+    result = getattr(endpoint, methodName)()
+
+    assert result is False
+    assert endpoint.txCutoff is True
+    cs.unwrap.assert_called_once_with()
+    cs.shutdown.assert_not_called()
+
+
+@pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
+@pytest.mark.parametrize("methodName", ("shutdownSend", "shutdownReceive"))
+def test_tls_directional_shutdown_surfaces_unwrap_error(endpointCls,
+                                                         methodName):
+    """Directional TLS shutdown does not hide a close_notify failure."""
+    cs = Mock(spec=ssl.SSLSocket)
+    failure = ssl.SSLError(ssl.SSL_ERROR_SSL, "fatal close")
+    cs.unwrap.side_effect = failure
+    endpoint = makeTlsEndpoint(endpointCls, cs)
+
+    with pytest.raises(ssl.SSLError) as excinfo:
+        getattr(endpoint, methodName)()
+
+    assert excinfo.value is failure
+    assert endpoint.error is failure
+
+
+@pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
+def test_tls_close_waits_for_accepted_output(endpointCls):
+    """TLS close starts only after accepted output has settled."""
+    cs = Mock(spec=ssl.SSLSocket)
+    cs.unwrap.side_effect = ssl.SSLWantWriteError(
+        ssl.SSL_ERROR_WANT_WRITE, "want write")
+    endpoint = makeTlsEndpoint(endpointCls, cs)
+    endpoint.tx(b"pending")
+
+    assert endpoint.serviceClose() is False
+    assert endpoint.txCutoff is False
+    cs.unwrap.assert_not_called()
+
+    endpoint.txbs.clear()  # owner reports egress settled
+    assert endpoint.serviceClose() is False
+    assert endpoint.txCutoff is True
+    cs.unwrap.assert_called_once_with()
+
+
+@pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
+def test_tls_close_bypasses_unwrap_after_terminal_send(endpointCls):
+    """A fatal socket error force closes without attempting TLS unwrap."""
+    cs = Mock(spec=ssl.SSLSocket)
+    failure = BrokenPipeError(errno.EPIPE, "broken pipe")
+    cs.send.side_effect = failure
+    endpoint = makeTlsEndpoint(endpointCls, cs)
+    endpoint.tx(b"unsent")
+
+    endpoint.serviceSends()
+
+    assert endpoint.serviceClose() is True
+    assert endpoint.error is failure
+    assert bytes(endpoint.txbs) == b"unsent"
+    assert endpoint.cutoff is True
+    assert endpoint.txCutoff is True
+    assert endpoint.cs is None
+    cs.unwrap.assert_not_called()
+    cs.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
+@pytest.mark.parametrize(
+    "errorCls, errno_",
+    ((ssl.SSLEOFError, ssl.SSL_ERROR_EOF),
+     (ssl.SSLError, ssl.SSL_ERROR_SSL)),
+)
+def test_tls_close_records_terminal_unwrap_error(endpointCls,
+                                                  errorCls,
+                                                  errno_):
+    """A terminal unwrap error is retained and force closes TLS."""
+    cs = Mock(spec=ssl.SSLSocket)
+    failure = errorCls(errno_, "fatal close")
+    cs.unwrap.side_effect = failure
+    endpoint = makeTlsEndpoint(endpointCls, cs)
+
+    with pytest.raises(errorCls) as excinfo:
+        endpoint.serviceClose()
+
+    assert excinfo.value is failure
+    assert endpoint.error is failure
+    assert endpoint.cutoff is True
+    assert endpoint.txCutoff is True
+    assert endpoint.cs is None
+    cs.close.assert_called_once_with()
+
+    assert endpoint.serviceClose() is True
+    cs.unwrap.assert_called_once_with()
+
+
+@pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
+def test_tls_close_before_handshake_force_closes(endpointCls):
+    """A TLS socket without a completed handshake cannot unwrap cleanly."""
+    cs = Mock(spec=ssl.SSLSocket)
+    endpoint = makeTlsEndpoint(endpointCls, cs)
+    endpoint.connected = False
+
+    assert endpoint.serviceClose() is True
+    assert endpoint.cutoff is True
+    assert endpoint.txCutoff is True
+    assert endpoint.cs is None
+    cs.unwrap.assert_not_called()
+    cs.close.assert_called_once_with()
+
+
 @pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
 def test_tls_clean_close_ends_only_receive(endpointCls):
     """A peer close_notify cleanly ends only the receive direction."""
