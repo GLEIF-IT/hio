@@ -11,10 +11,12 @@ import sys
 import os
 import time
 import socket
+import errno
 from collections import deque
 from unittest.mock import Mock
 import ssl
 
+from hio import hioing
 from hio.base import tyming, doing
 from hio.core import tcp
 
@@ -797,6 +799,87 @@ def localTestCertDirPath():
                     os.path.abspath(
                         sys.modules.get(__name__).__file__))
     return(os.path.join(localDirPath, 'certs'))
+
+
+def test_client_tracks_terminal_send_separately():
+    """Client broken pipe preserves receive service and unsent output."""
+    client = tcp.Client(ha=("127.0.0.1", 6101))
+    client.cs = Mock(spec=socket.socket)
+    failure = BrokenPipeError(errno.EPIPE, "broken pipe")
+    client.cs.send.side_effect = failure
+    client.accepted = True
+    message = b"unsent"
+    client.tx(message)
+
+    client.serviceSends()
+
+    assert client.cutoff is False
+    assert client.txCutoff is True
+    assert bytes(client.txbs) == message
+    assert client.error is failure
+
+
+def test_client_peer_eof_preserves_send_direction():
+    """Client receive EOF does not suppress already accepted output."""
+    client = tcp.Client(ha=("127.0.0.1", 6101))
+    client.cs = Mock(spec=socket.socket)
+    client.cs.recv.return_value = b""
+    client.cs.send.return_value = len(b"response")
+    client.accepted = True
+
+    client.serviceReceives()
+    assert client.cutoff is True
+    assert client.txCutoff is False
+
+    client.tx(b"response")
+    client.serviceSends()
+    assert not client.txbs
+
+
+def test_client_receive_failure_closes_both_directions():
+    """A connection reset is terminal for Client receive and transmit."""
+    client = tcp.Client(ha=("127.0.0.1", 6101))
+    failure = ConnectionResetError(errno.ECONNRESET, "reset")
+    client.cs = Mock(spec=socket.socket)
+    client.cs.recv.side_effect = failure
+    client.accepted = True
+
+    assert client.receive() == b""
+    assert client.cutoff is True
+    assert client.txCutoff is True
+    assert client.error is failure
+
+
+def test_client_rejects_enqueue_after_transmit_close():
+    """Queueing after transmit close raises without replacing its cause."""
+    client = tcp.Client(ha=("127.0.0.1", 6101))
+    failure = BrokenPipeError(errno.EPIPE, "broken pipe")
+    client.txCutoff = True
+    client.error = failure
+
+    with pytest.raises(hioing.TransmitClosedError) as excinfo:
+        client.tx(b"rejected")
+
+    assert excinfo.value.__cause__ is failure
+    assert client.error is failure
+    assert not client.txbs
+
+
+def test_client_reopen_resets_directional_state():
+    """A newly allocated Client socket resets prior connection facts."""
+    client = tcp.Client(ha=("127.0.0.1", 6101))
+    failure = BrokenPipeError(errno.EPIPE, "broken pipe")
+    client.cutoff = True
+    client.txCutoff = True
+    client.error = failure
+
+    client.open()
+    try:
+        assert client.cutoff is False
+        assert client.txCutoff is False
+        assert client.error is None
+    finally:
+        client.close()
 
 def  test_tcp_tls_default_context():
     """

@@ -12,7 +12,7 @@ import ssl
 from contextlib import contextmanager
 
 
-from ... import help
+from ... import help, hioing
 from ...base import tyming, doing
 from .. import coring, wiring
 
@@ -105,6 +105,8 @@ class Client(tyming.Tymee):
         self.ca = (None, None)  # host address of local connection
         self._accepted = False  # attribute to support accepted property
         self.cutoff = False  # True when detect connection closed on far side
+        self.txCutoff = False  # True when send direction is closed
+        self.error = None  # retained terminal transport exception if any
         self.reconnectable = reconnectable if reconnectable is not None else self.Reconnectable
         self.opened = False
 
@@ -207,12 +209,15 @@ class Client(tyming.Tymee):
         if socket not closed properly, binding socket gets error
           OSError: (48, 'Address already in use')
         """
+        #create connection socket
+        self.cs = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+        # reset connection facts only after allocating a new socket
         self.accepted = False
         self.connected = False
         self.cutoff = False
-
-        #create connection socket
-        self.cs = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.txCutoff = False
+        self.error = None
 
         # make socket address reusable.
         # the SO_REUSEADDR flag tells the kernel to reuse a local socket in
@@ -322,7 +327,6 @@ class Client(tyming.Tymee):
         self.ha = self.cs.getpeername()  # resolved remote connection address
 
         self.accepted = True  # also sets .connected == True
-        self.cutoff = False
         return True
 
 
@@ -382,6 +386,8 @@ class Client(tyming.Tymee):
                                 errno.ECONNREFUSED):
 
                 self.cutoff = True  # this signals need to close/reopen connection
+                self.txCutoff = True
+                self.error = ex
                 return bytes()  # data empty
             else:
                 logger.error("Error: Receive on HTTP Client '%s'."
@@ -438,9 +444,10 @@ class Client(tyming.Tymee):
             # the value of a given errno.XXXXX may be different on each os
             # EAGAIN: BSD 35, Linux 11, Windows 11
             # EWOULDBLOCK: BSD 35 Linux 11 Windows 140
-            if ex.args[0] in (errno.EAGAIN, errno.EWOULDBLOCK):
+            if ex.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
                 count = 0  # blocked try again
-            elif ex.args[0] in (errno.ECONNRESET,
+            elif isinstance(ex, BrokenPipeError) or ex.errno in (
+                                errno.ECONNRESET,
                                 errno.ENETRESET,
                                 errno.ENETUNREACH,
                                 errno.EHOSTUNREACH,
@@ -449,7 +456,8 @@ class Client(tyming.Tymee):
                                 errno.ETIMEDOUT,
                                 errno.ECONNREFUSED):
 
-                self.cutoff = True  # this signals need to close/reopen connection
+                self.txCutoff = True  # send failed but receive may still drain
+                self.error = ex
                 count = 0
             else:
                 logger.error("Error: Send on HTTP Client '%s'."
@@ -467,6 +475,13 @@ class Client(tyming.Tymee):
         """
         Copy data onto .txbs, .extend copies data.
         """
+        if self.txCutoff:  # reject output that can no longer be sent
+            ex = hioing.TransmitClosedError(
+                "connection send direction is closed")
+            if self.error is None:
+                self.error = ex
+                raise ex
+            raise ex from self.error  # preserve originating transport failure
         self.txbs.extend(data)
 
 
@@ -475,7 +490,8 @@ class Client(tyming.Tymee):
         Service sends (transmits) of data in .txbs bytearray
         Attempt to send all of .txbs. Delete what is actually sent.
         """
-        while self.txbs and self.connected and not self.cutoff:
+        # received peer EOF does not close this connection's send direction
+        while self.txbs and self.connected and not self.txCutoff:
             count = self.send(self.txbs)
             del self.txbs[:count]
             break  # try again later
