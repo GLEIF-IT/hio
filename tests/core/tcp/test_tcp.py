@@ -834,6 +834,7 @@ def openTlsPair(version):
                            certify=ssl.CERT_NONE)
     assert client.reopen()
 
+    # Drive the nonblocking TCP accept and TLS handshake to completion.
     for _ in range(1000):
         client.serviceConnect()
         server.serviceConnects()
@@ -855,6 +856,29 @@ def closeTlsPair(server, client, remoter):
     remoter.close()
     server.ixes.clear()
     server.close()
+
+
+def driveTlsClosePair(client, remoter):
+    """Drive scheduler-like TLS receive and close service to completion."""
+    clientDone = False
+    remoterDone = False
+    for _ in range(1000):
+        # Consume incoming TLS records, including close_notify, as a
+        # scheduler would during normal receive service.
+        client.serviceReceives()
+        remoter.serviceReceives()
+
+        # Advance each endpoint's nonblocking unwrap state machine until
+        # both sides finish their close_notify exchange.
+        if not clientDone:
+            clientDone = client.serviceClose()
+        if not remoterDone:
+            remoterDone = remoter.serviceClose()
+        if clientDone and remoterDone:
+            return
+        time.sleep(0.001)
+
+    pytest.fail("TLS close did not complete on both endpoints")
 
 
 def makeTlsEndpoint(endpointCls, cs):
@@ -909,7 +933,7 @@ def makeTlsEndpoint(endpointCls, cs):
      (ssl.SSLWantWriteError, ssl.SSL_ERROR_WANT_WRITE)),
 )
 def test_tls_receive_retries_typed_want(endpointCls, errorCls, errno_):
-    """A typed TLS WANT condition is retryable, not terminal."""
+    """Retry receive when OpenSSL needs either read or write readiness."""
     cs = Mock(spec=ssl.SSLSocket)
     cs.recv.side_effect = errorCls(errno_, "retry receive")
     endpoint = makeTlsEndpoint(endpointCls, cs)
@@ -927,7 +951,7 @@ def test_tls_receive_retries_typed_want(endpointCls, errorCls, errno_):
      (ssl.SSLWantWriteError, ssl.SSL_ERROR_WANT_WRITE)),
 )
 def test_tls_send_retries_typed_want(endpointCls, errorCls, errno_):
-    """A typed TLS WANT condition preserves output for a later cycle."""
+    """Preserve output when TLS send needs either readiness direction."""
     cs = Mock(spec=ssl.SSLSocket)
     cs.send.side_effect = errorCls(errno_, "retry send")
     endpoint = makeTlsEndpoint(endpointCls, cs)
@@ -1020,33 +1044,29 @@ def test_tls_force_close_does_not_raw_shutdown(endpointCls):
     (ssl.TLSVersion.TLSv1_3, ssl.TLSVersion.TLSv1_2),
 )
 @pytest.mark.parametrize("initiatorName", ("client", "remoter"))
-def test_tls_local_close_recurs_and_rejects_late_writes(version,
-                                                         initiatorName):
-    """Real TLS close retries and admits no later application output."""
+def test_tls_local_close_rejects_late_writes_and_completes_recurrently(
+        version, initiatorName):
+    """Initiate local TLS close, reject later writes, and finish recurrently.
+
+    The first serviceClose call starts nonblocking unwrap. Normal scheduler
+    receive and close service then lets both endpoints exchange close_notify
+    according to the negotiated TLS version.
+    """
     server, client, remoter = openTlsPair(version)
     initiator = client if initiatorName == "client" else remoter
 
     try:
+        # Start local unwrap and latch the application send direction closed.
+        # False means the nonblocking close needs later I/O recurrences.
         assert initiator.serviceClose() is False
         with pytest.raises(hioing.TransmitClosedError, match="closed"):
             initiator.tx(b"late output")
         assert not initiator.txbs
 
-        clientDone = False
-        remoterDone = False
-        for _ in range(1000):
-            client.serviceReceives()
-            remoter.serviceReceives()
-            if not clientDone:
-                clientDone = client.serviceClose()
-            if not remoterDone:
-                remoterDone = remoter.serviceClose()
-            if clientDone and remoterDone:
-                break
-            time.sleep(0.001)
+        driveTlsClosePair(client, remoter)
 
-        assert clientDone is True
-        assert remoterDone is True
+        assert client.cs is None
+        assert remoter.cs is None
         assert client.accepted is False
         assert client.opened is False
     finally:
@@ -1058,9 +1078,14 @@ def test_tls_local_close_recurs_and_rejects_late_writes(version,
     (ssl.TLSVersion.TLSv1_3, ssl.TLSVersion.TLSv1_2),
 )
 @pytest.mark.parametrize("receiverName", ("client", "remoter"))
-def test_tls_local_close_preserves_real_pending_plaintext(version,
-                                                           receiverName):
-    """Real recurrent close retains plaintext already buffered by TLS."""
+def test_tls_local_close_drains_real_buffered_plaintext(version,
+                                                         receiverName):
+    """Preserve plaintext already accepted before local TLS shutdown.
+
+    TLS version changes how peer close affects future writes, but neither
+    version permits plaintext already received by TLS to disappear during
+    unwrap.
+    """
     server, client, remoter = openTlsPair(version)
     receiver = client if receiverName == "client" else remoter
     sender = remoter if receiverName == "client" else client
@@ -1068,6 +1093,7 @@ def test_tls_local_close_preserves_real_pending_plaintext(version,
 
     try:
         sender.tx(message)
+        # Put the complete application message on the wire before shutdown.
         for _ in range(1000):
             sender.serviceSends()
             if not sender.txbs:
@@ -1075,10 +1101,12 @@ def test_tls_local_close_preserves_real_pending_plaintext(version,
             time.sleep(0.001)
         assert not sender.txbs
 
+        # Consume one byte deliberately, leaving decrypted plaintext buffered
+        # inside TLS for close service to preserve.
         first = None
         for _ in range(1000):
             try:
-                first = receiver.cs.recv(1)  # leave the rest buffered in TLS
+                first = receiver.cs.recv(1)
             except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
                 time.sleep(0.001)
                 continue
@@ -1088,6 +1116,8 @@ def test_tls_local_close_preserves_real_pending_plaintext(version,
         assert receiver.cs.pending() > 0
         assert receiver.serviceClose() is False
 
+        # Advance only recurrent unwrap here. Normal receive service is
+        # intentionally omitted so serviceClose owns the plaintext drain.
         clientDone = False
         remoterDone = False
         for _ in range(1000):
@@ -1107,18 +1137,28 @@ def test_tls_local_close_preserves_real_pending_plaintext(version,
 
 
 @pytest.mark.parametrize("initiatorName", ("client", "remoter"))
-def test_tls_close_drains_data_arriving_after_want_read(initiatorName):
-    """Local close preserves TLS 1.3 data sent after unwrap wants read."""
+def test_tls13_local_close_drains_plaintext_arriving_after_want_read(
+        initiatorName):
+    """Preserve TLS 1.3 data sent after local unwrap enters WANT_READ.
+
+    TLS 1.3 close_notify ends only its sender's write direction. After the
+    peer receives the initiator's close_notify, the peer may still send
+    application data before independently beginning its own close.
+    """
     server, client, remoter = openTlsPair(ssl.TLSVersion.TLSv1_3)
     initiator = client if initiatorName == "client" else remoter
     peer = remoter if initiatorName == "client" else client
     message = b"plaintext sent after local close_notify" * 32
 
     try:
+        # Start local unwrap before any late peer data exists and prove that
+        # it has reached the state that needs peer input.
         assert initiator.serviceClose() is False
         assert initiator._closing is True
         assert initiator._closeWantRead is True
 
+        # Deliver the initiator's close_notify before the peer queues data;
+        # this ordering is the race the test protects.
         for _ in range(1000):
             peer.serviceReceives()
             if peer.cutoff:
@@ -1127,6 +1167,7 @@ def test_tls_close_drains_data_arriving_after_want_read(initiatorName):
         assert peer.cutoff is True  # peer observed initiator close_notify
         assert peer.txCutoff is False
 
+        # TLS 1.3 leaves the peer's independent write direction available.
         peer.tx(message)
         for _ in range(1000):
             peer.serviceSends()
@@ -1135,6 +1176,8 @@ def test_tls_close_drains_data_arriving_after_want_read(initiatorName):
             time.sleep(0.001)
         assert not peer.txbs
 
+        # Advance the initiator's unwrap. Its WANT_READ close path must drain
+        # the racing plaintext before retrying unwrap.
         for _ in range(1000):
             assert initiator.serviceClose() is False
             if bytes(initiator.rxbs) == message:
@@ -1144,19 +1187,9 @@ def test_tls_close_drains_data_arriving_after_want_read(initiatorName):
         assert initiator.error is None
         assert peer.error is None
 
-        initiatorDone = False
-        peerDone = False
-        for _ in range(1000):
-            if not peerDone:
-                peerDone = peer.serviceClose()
-            if not initiatorDone:
-                initiatorDone = initiator.serviceClose()
-            if initiatorDone and peerDone:
-                break
-            time.sleep(0.001)
+        # The peer now begins its own close so both unwrap operations finish.
+        driveTlsClosePair(client, remoter)
 
-        assert initiatorDone is True
-        assert peerDone is True
         assert initiator.serviceClose() is True
         assert peer.serviceClose() is True
         assert initiator.cs is None
@@ -1167,10 +1200,12 @@ def test_tls_close_drains_data_arriving_after_want_read(initiatorName):
 
 
 @pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
-def test_tls_close_retries_want_and_drains_pending_plaintext(endpointCls):
-    """Recurrent close preserves pending plaintext before retrying unwrap."""
+def test_tls_recurrent_close_retries_want_and_drains_plaintext(endpointCls):
+    """Preserve pending plaintext across recurrent WANT states."""
     cs = Mock(spec=ssl.SSLSocket)
     raw = Mock(spec=socket.socket)
+    # Script three scheduler recurrences through unwrap: WANT_WRITE,
+    # WANT_READ, and then successful completion with the raw socket.
     cs.unwrap.side_effect = [
         ssl.SSLWantWriteError(ssl.SSL_ERROR_WANT_WRITE, "want write"),
         ssl.SSLWantReadError(ssl.SSL_ERROR_WANT_READ, "want read"),
@@ -1184,10 +1219,13 @@ def test_tls_close_retries_want_and_drains_pending_plaintext(endpointCls):
     ]
     endpoint = makeTlsEndpoint(endpointCls, cs)
 
+    # The first recurrence drains TLS-buffered plaintext before WANT_WRITE.
     assert endpoint.serviceClose() is False
     assert endpoint.txCutoff is True
     assert bytes(endpoint.rxbs) == b"pending"
+    # The second recurrence reaches WANT_READ without treating it as failure.
     assert endpoint.serviceClose() is False
+    # The third recurrence services that read path and completes unwrap.
     assert endpoint.serviceClose() is True
     assert endpoint.serviceClose() is True
     assert endpoint.cutoff is True
@@ -1319,8 +1357,17 @@ def test_tls_close_before_handshake_force_closes(endpointCls):
 @pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
 @pytest.mark.parametrize("version, txCutoff", (("TLSv1.3", False),
                                                 ("TLSv1.2", True)))
-def test_tls_clean_close_is_version_aware(endpointCls, version, txCutoff):
-    """Clean peer close follows the negotiated TLS version policy."""
+def test_tls_peer_close_applies_negotiated_version_policy(endpointCls,
+                                                           version,
+                                                           txCutoff):
+    """Apply negotiated-version policy after receiving close_notify.
+
+    TLS 1.2 requires the receiver to discard pending writes, reciprocate with
+    close_notify, and close immediately (RFC 5246, Section 7.2.1). TLS 1.3
+    makes close_notify directional: it ends the sender's write direction
+    without ending its read direction (RFC 8446, Section 6.1). HIO therefore
+    closes transmit on TLS 1.2 peer close but preserves it for TLS 1.3.
+    """
     cs = Mock(spec=ssl.SSLSocket)
     raw = Mock(spec=socket.socket)
     cs.version.return_value = version
@@ -1349,8 +1396,13 @@ def test_tls_clean_close_is_version_aware(endpointCls, version, txCutoff):
 
 
 @pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
-def test_tls_clean_close_requires_negotiated_version(endpointCls):
-    """Missing negotiated version fails closed after clean TLS EOF."""
+def test_tls_peer_close_requires_negotiated_version(endpointCls):
+    """Fail closed when peer-close policy cannot be selected.
+
+    Without the negotiated version, HIO cannot determine whether peer
+    close_notify requires immediate transmit shutdown or permits the
+    independent send direction to remain open.
+    """
     cs = Mock(spec=ssl.SSLSocket)
     cs.version.return_value = None
     cs.recv.side_effect = ssl.SSLZeroReturnError(
@@ -1373,10 +1425,14 @@ def test_tls_clean_close_requires_negotiated_version(endpointCls):
      (ssl.TLSVersion.TLSv1_2, True)),
 )
 @pytest.mark.parametrize("receiverName", ("client", "remoter"))
-def test_tls_peer_close_obeys_negotiated_version(version,
-                                                  txCutoff,
-                                                  receiverName):
-    """Peer close preserves TLS 1.3 output and rejects TLS 1.2 output."""
+def test_real_tls_peer_close_applies_negotiated_version_policy(
+        version, txCutoff, receiverName):
+    """Prove negotiated peer-close policy over real TLS connections.
+
+    After receiving close_notify, TLS 1.2 must abandon pending output and
+    close reciprocally. TLS 1.3 keeps this endpoint's independent send
+    direction available until it initiates its own close.
+    """
     server, client, remoter = openTlsPair(version)
     receiver = client if receiverName == "client" else remoter
     closer = remoter if receiverName == "client" else client
@@ -1384,9 +1440,13 @@ def test_tls_peer_close_obeys_negotiated_version(version,
 
     try:
         receiver.tx(response)
+        # Bypass HIO only to make the selected peer send close_notify first;
+        # WANT means its unwrap is waiting for the reciprocal close_notify.
         with pytest.raises((ssl.SSLWantReadError, ssl.SSLWantWriteError)):
             closer.cs.unwrap()
 
+        # Consume close_notify and apply the negotiated-version policy to the
+        # receiver's independent send direction.
         for _ in range(1000):
             receiver.serviceReceives()
             if receiver.cutoff:
@@ -1396,6 +1456,7 @@ def test_tls_peer_close_obeys_negotiated_version(version,
         assert receiver.txCutoff is txCutoff
 
         if version == ssl.TLSVersion.TLSv1_3:
+            # TLS 1.3 permits the already accepted response after peer close.
             receiver.serviceSends()
             assert not receiver.txbs
             received = None
@@ -1406,11 +1467,13 @@ def test_tls_peer_close_obeys_negotiated_version(version,
                 time.sleep(0.001)
             assert received == response
         else:
+            # TLS 1.2 strands the accepted response and closes reciprocally.
             assert bytes(receiver.txbs) == response
             assert isinstance(receiver.error, hioing.TransmitClosedError)
             assert "TLSv1.2" in str(receiver.error)
             assert "{0} unsent bytes".format(len(response)) in str(
                 receiver.error)
+            # Advance the reciprocal unwrap until the raw socket is released.
             for _ in range(1000):
                 if receiver.serviceClose():
                     break
@@ -1455,8 +1518,8 @@ def test_tls_abrupt_eof_is_truncation(receiverName):
         closeTlsPair(server, client, remoter)
 
 
-def test_client_shutdown_sets_directional_cutoffs():
-    """Directional shutdown records state and preserves the other half."""
+def test_client_directional_shutdown_preserves_opposite_half():
+    """Close each Client direction without conflating independent halves."""
     cs, peer = socket.socketpair()
     peer.settimeout(1.0)
     client = tcp.Client(ha=("127.0.0.1", 6101))
@@ -1464,6 +1527,8 @@ def test_client_shutdown_sets_directional_cutoffs():
     client.accepted = True
 
     try:
+        # Local SHUT_RD closes only Client receive; Client output can still
+        # reach the peer through the independent send direction.
         client.shutdownReceive()
         assert client.cutoff is True
         assert client.txCutoff is False
@@ -1474,6 +1539,7 @@ def test_client_shutdown_sets_directional_cutoffs():
         assert not client.txbs
         assert peer.recv(len(message)) == message
 
+        # Local SHUT_WR exposes EOF to the peer and rejects later Client output.
         client.shutdownSend()
         assert client.cutoff is True
         assert client.txCutoff is True
@@ -1500,16 +1566,19 @@ def test_tcp_service_close_waits_for_egress_and_peer_eof(endpointCls):
                                    cs=cs)
 
     endpoint.tx(b"pending")
+    # Accepted output keeps recurrent close from issuing SHUT_WR.
     assert endpoint.serviceClose() is False
     assert endpoint.txCutoff is False
     cs.shutdown.assert_not_called()
 
-    endpoint.txbs.clear()  # owner reports egress settled
+    # Once the owner reports egress settled, close advances to local SHUT_WR.
+    endpoint.txbs.clear()
     assert endpoint.serviceClose() is False
     assert endpoint.txCutoff is True
     cs.shutdown.assert_called_once_with(socket.SHUT_WR)
 
-    endpoint.cutoff = True  # peer EOF completes receive direction
+    # Independent peer EOF completes the remaining receive direction.
+    endpoint.cutoff = True
     assert endpoint.serviceClose() is True
     assert endpoint.cs is None
     cs.close.assert_called_once_with()
@@ -1576,7 +1645,11 @@ def test_client_peer_eof_preserves_send_direction():
 
 
 def test_client_sends_late_output_after_real_peer_half_close():
-    """A real peer receive EOF does not close the Client send half."""
+    """Send a response after Client observes real peer EOF.
+
+    Peer SHUT_WR closes only its TCP send direction. Client therefore sees
+    receive EOF while retaining its independent send direction.
+    """
     cs, peer = socket.socketpair()
     peer.settimeout(1.0)
     client = tcp.Client(ha=("127.0.0.1", 6101))
@@ -1584,6 +1657,7 @@ def test_client_sends_late_output_after_real_peer_half_close():
     client.accepted = True
 
     try:
+        # Establish receive EOF before response output is accepted.
         peer.shutdown(socket.SHUT_WR)
         client.serviceReceives()
 
@@ -1591,6 +1665,7 @@ def test_client_sends_late_output_after_real_peer_half_close():
         assert client.txCutoff is False
         assert client.error is None
 
+        # Queue only after EOF, proving this is a genuinely late response.
         response = b"response after real peer EOF"
         client.tx(response)
         for _ in range(1000):
@@ -1612,7 +1687,11 @@ def test_client_sends_late_output_after_real_peer_half_close():
 
 
 def test_client_service_close_drains_real_output_then_waits_for_peer_eof():
-    """Real recurrent close orders output, write EOF, and peer EOF."""
+    """Drain output before write EOF, then await independent peer EOF.
+
+    TCP half-close permits the peer to send final input after observing
+    Client write EOF. Full close completes only after both directions end.
+    """
     cs, peer = socket.socketpair()
     peer.settimeout(1.0)
     client = tcp.Client(ha=("127.0.0.1", 6101))
@@ -1623,6 +1702,7 @@ def test_client_service_close_drains_real_output_then_waits_for_peer_eof():
 
     try:
         client.tx(outbound)
+        # Close cannot issue SHUT_WR while accepted output remains queued.
         assert client.serviceClose() is False
         assert client.txCutoff is False
 
@@ -1640,15 +1720,19 @@ def test_client_service_close_drains_real_output_then_waits_for_peer_eof():
             received.extend(chunk)
         assert bytes(received) == outbound
 
+        # With output drained, close advances to SHUT_WR but keeps Client
+        # receive open for final peer input.
         assert client.serviceClose() is False
         assert client.txCutoff is True
         assert client.cutoff is False
         assert peer.recv(1) == b""  # all output preceded local write EOF
 
+        # The peer may still send final input after observing Client write EOF.
         peer.sendall(inbound)
         peer.shutdown(socket.SHUT_WR)
         client.serviceReceives()
 
+        # Peer SHUT_WR supplies the independent EOF needed to finish close.
         assert bytes(client.rxbs) == inbound
         assert client.cutoff is True
         assert client.serviceClose() is True
@@ -2581,7 +2665,11 @@ def test_echo_server_client_doers():
 
 
 def test_remoter_services_sends_after_peer_half_close():
-    """Receive EOF does not prevent a Remoter from sending its response."""
+    """Send a response after Remoter observes real peer EOF.
+
+    Peer SHUT_WR closes only its TCP send direction. Remoter therefore sees
+    receive EOF while retaining its independent send direction.
+    """
     tymist = tyming.Tymist()
     cs, peer = socket.socketpair()
     peer.settimeout(1.0)
@@ -2591,12 +2679,14 @@ def test_remoter_services_sends_after_peer_half_close():
                          tymth=tymist.tymen())
 
     try:
+        # Establish receive EOF before response output is accepted.
         peer.shutdown(socket.SHUT_WR)
         remoter.serviceReceives()
 
         assert remoter.cutoff is True
         assert remoter.txCutoff is False
 
+        # Queue only after EOF, proving this is a genuinely late response.
         response = b"response after request EOF"
         remoter.tx(response)
         remoter.serviceSends()
