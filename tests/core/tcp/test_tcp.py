@@ -19,6 +19,7 @@ import ssl
 from hio import hioing
 from hio.base import tyming, doing
 from hio.core import tcp
+from hio.core.tcp import serving
 
 
 @pytest.mark.parametrize(
@@ -799,6 +800,165 @@ def localTestCertDirPath():
                     os.path.abspath(
                         sys.modules.get(__name__).__file__))
     return(os.path.join(localDirPath, 'certs'))
+
+
+def openTlsPair(version):
+    """Open a loopback TLS pair pinned to version."""
+    certDirPath = localTestCertDirPath()
+
+    serverContext = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    serverContext.minimum_version = version
+    serverContext.maximum_version = version
+    serverContext.verify_mode = ssl.CERT_NONE
+    serverContext.load_cert_chain(
+        certfile=os.path.join(certDirPath, 'server_cert.pem'),
+        keyfile=os.path.join(certDirPath, 'server_key.pem'))
+
+    clientContext = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    clientContext.minimum_version = version
+    clientContext.maximum_version = version
+    clientContext.check_hostname = False
+    clientContext.verify_mode = ssl.CERT_NONE
+
+    tymist = tyming.Tymist()
+    server = tcp.ServerTls(tymth=tymist.tymen(),
+                           ha=('127.0.0.1', 0),
+                           context=serverContext,
+                           certify=ssl.CERT_NONE)
+    assert server.reopen()
+    server.eha = server.ha
+
+    client = tcp.ClientTls(tymth=tymist.tymen(),
+                           ha=server.ha,
+                           context=clientContext,
+                           certify=ssl.CERT_NONE)
+    assert client.reopen()
+
+    for _ in range(1000):
+        client.serviceConnect()
+        server.serviceConnects()
+        if client.connected and server.ixes:
+            break
+        time.sleep(0.001)
+
+    assert client.connected
+    assert len(server.ixes) == 1
+    remoter = next(iter(server.ixes.values()))
+    negotiated = version.name.replace("_", ".")
+    assert client.cs.version() == remoter.cs.version() == negotiated
+    return server, client, remoter
+
+
+def closeTlsPair(server, client, remoter):
+    """Force close a loopback TLS pair after an assertion."""
+    client.close()
+    remoter.close()
+    server.ixes.clear()
+    server.close()
+
+
+def makeTlsEndpoint(endpointCls, cs):
+    """Make a TLS endpoint around a deterministic socket fake."""
+    context = Mock(spec=ssl.SSLContext)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    context.wrap_socket.return_value = cs
+
+    if endpointCls is tcp.ClientTls:
+        endpoint = tcp.ClientTls(context=context,
+                                 certify=ssl.CERT_NONE,
+                                 ha=("127.0.0.1", 6101))
+        raw = Mock(spec=socket.socket)
+        endpoint.cs = raw
+        endpoint.wrap()
+        context.wrap_socket.assert_called_once_with(
+            raw,
+            server_side=False,
+            do_handshake_on_connect=False,
+            server_hostname=endpoint.certedhost,
+            suppress_ragged_eofs=False)
+        endpoint.accepted = True
+        endpoint.connected = True
+    else:
+        raw = Mock(spec=socket.socket)
+        endpoint = serving.RemoterTls(context=context,
+                                      certify=ssl.CERT_NONE,
+                                      ha=("127.0.0.1", 6101),
+                                      ca=("127.0.0.1", 6102),
+                                      cs=raw)
+        raw.setblocking.assert_called_once_with(0)
+        context.wrap_socket.assert_called_once_with(
+            raw,
+            server_side=True,
+            do_handshake_on_connect=False,
+            suppress_ragged_eofs=False)
+        endpoint.connected = True
+
+    assert endpoint.cs is cs
+    return endpoint
+
+
+@pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
+def test_tls_receive_retries_typed_want(endpointCls):
+    """A typed TLS WANT condition is retryable, not terminal."""
+    cs = Mock(spec=ssl.SSLSocket)
+    cs.recv.side_effect = ssl.SSLWantReadError(
+        ssl.SSL_ERROR_WANT_READ, "want read")
+    endpoint = makeTlsEndpoint(endpointCls, cs)
+
+    assert endpoint.receive() is None
+    assert endpoint.cutoff is False
+    assert endpoint.txCutoff is False
+    assert endpoint.error is None
+
+
+@pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
+def test_tls_clean_close_ends_only_receive(endpointCls):
+    """A peer close_notify cleanly ends only the receive direction."""
+    cs = Mock(spec=ssl.SSLSocket)
+    cs.recv.side_effect = ssl.SSLZeroReturnError(
+        ssl.SSL_ERROR_ZERO_RETURN, "close notify")
+    endpoint = makeTlsEndpoint(endpointCls, cs)
+
+    assert endpoint.receive() == b""
+    assert endpoint.cutoff is True
+    assert endpoint.txCutoff is False
+    assert endpoint.error is None
+
+
+@pytest.mark.parametrize("receiverName", ("client", "remoter"))
+def test_tls_abrupt_eof_is_truncation(receiverName):
+    """Real raw TCP EOF without close_notify is a TLS failure."""
+    server, client, remoter = openTlsPair(ssl.TLSVersion.TLSv1_3)
+    receiver = client if receiverName == "client" else remoter
+    closer = remoter if receiverName == "client" else client
+
+    try:
+        closer.cs.close()  # bypass TLS shutdown to create a ragged EOF
+        closer.cs = None
+        failure = None
+        for _ in range(1000):
+            if receiver is remoter:
+                server.serviceReceivesAllIx()
+                failure = remoter.error
+            else:
+                try:
+                    receiver.receive()
+                except OSError as ex:
+                    failure = ex
+            if failure is not None:
+                break
+            time.sleep(0.001)
+
+        assert failure is not None
+        assert receiver.cutoff is True
+        assert receiver.txCutoff is True
+        assert receiver.error is failure
+        assert receiver.cs is None
+        if receiver is remoter:
+            assert not server.ixes
+    finally:
+        closeTlsPair(server, client, remoter)
 
 
 def test_client_tracks_terminal_send_separately():
