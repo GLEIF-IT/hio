@@ -1456,8 +1456,9 @@ def test_tls_abrupt_eof_is_truncation(receiverName):
 
 
 def test_client_shutdown_sets_directional_cutoffs():
-    """Successful local shutdown records only the affected directions."""
+    """Directional shutdown records state and preserves the other half."""
     cs, peer = socket.socketpair()
+    peer.settimeout(1.0)
     client = tcp.Client(ha=("127.0.0.1", 6101))
     client.cs = cs
     client.accepted = True
@@ -1467,9 +1468,19 @@ def test_client_shutdown_sets_directional_cutoffs():
         assert client.cutoff is True
         assert client.txCutoff is False
 
+        message = b"send remains open after receive shutdown"
+        client.tx(message)
+        client.serviceSends()
+        assert not client.txbs
+        assert peer.recv(len(message)) == message
+
         client.shutdownSend()
         assert client.cutoff is True
         assert client.txCutoff is True
+        assert peer.recv(1) == b""
+
+        with pytest.raises(hioing.TransmitClosedError, match="closed"):
+            client.tx(b"late output")
     finally:
         client.close()
         peer.close()
@@ -1562,6 +1573,90 @@ def test_client_peer_eof_preserves_send_direction():
     client.tx(b"response")
     client.serviceSends()
     assert not client.txbs
+
+
+def test_client_sends_late_output_after_real_peer_half_close():
+    """A real peer receive EOF does not close the Client send half."""
+    cs, peer = socket.socketpair()
+    peer.settimeout(1.0)
+    client = tcp.Client(ha=("127.0.0.1", 6101))
+    client.cs = cs
+    client.accepted = True
+
+    try:
+        peer.shutdown(socket.SHUT_WR)
+        client.serviceReceives()
+
+        assert client.cutoff is True
+        assert client.txCutoff is False
+        assert client.error is None
+
+        response = b"response after real peer EOF"
+        client.tx(response)
+        for _ in range(1000):
+            client.serviceSends()
+            if not client.txbs:
+                break
+            time.sleep(0.001)
+        assert not client.txbs
+
+        received = bytearray()
+        while len(received) < len(response):
+            chunk = peer.recv(len(response) - len(received))
+            assert chunk
+            received.extend(chunk)
+        assert bytes(received) == response
+    finally:
+        client.close()
+        peer.close()
+
+
+def test_client_service_close_drains_real_output_then_waits_for_peer_eof():
+    """Real recurrent close orders output, write EOF, and peer EOF."""
+    cs, peer = socket.socketpair()
+    peer.settimeout(1.0)
+    client = tcp.Client(ha=("127.0.0.1", 6101))
+    client.cs = cs
+    client.accepted = True
+    outbound = b"output before local write shutdown"
+    inbound = b"final input before peer write shutdown"
+
+    try:
+        client.tx(outbound)
+        assert client.serviceClose() is False
+        assert client.txCutoff is False
+
+        for _ in range(1000):
+            client.serviceSends()
+            if not client.txbs:
+                break
+            time.sleep(0.001)
+        assert not client.txbs
+
+        received = bytearray()
+        while len(received) < len(outbound):
+            chunk = peer.recv(len(outbound) - len(received))
+            assert chunk
+            received.extend(chunk)
+        assert bytes(received) == outbound
+
+        assert client.serviceClose() is False
+        assert client.txCutoff is True
+        assert client.cutoff is False
+        assert peer.recv(1) == b""  # all output preceded local write EOF
+
+        peer.sendall(inbound)
+        peer.shutdown(socket.SHUT_WR)
+        client.serviceReceives()
+
+        assert bytes(client.rxbs) == inbound
+        assert client.cutoff is True
+        assert client.serviceClose() is True
+        assert client.serviceClose() is True
+        assert client.cs is None
+    finally:
+        client.close()
+        peer.close()
 
 
 def test_client_receive_failure_closes_both_directions():
