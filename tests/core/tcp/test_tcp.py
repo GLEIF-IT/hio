@@ -991,6 +991,19 @@ def test_tls_send_force_closes_connection_reset(endpointCls):
 
 
 @pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
+def test_tls_force_close_does_not_raw_shutdown(endpointCls):
+    """Force-closing TLS bypasses raw socket shutdown."""
+    cs = Mock(spec=ssl.SSLSocket)
+    endpoint = makeTlsEndpoint(endpointCls, cs)
+
+    endpoint.close()
+
+    assert endpoint.cs is None
+    cs.shutdown.assert_not_called()
+    cs.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
 def test_tls_clean_close_ends_only_receive(endpointCls):
     """A peer close_notify cleanly ends only the receive direction."""
     cs = Mock(spec=ssl.SSLSocket)
@@ -1037,6 +1050,80 @@ def test_tls_abrupt_eof_is_truncation(receiverName):
             assert not server.ixes
     finally:
         closeTlsPair(server, client, remoter)
+
+
+def test_client_shutdown_sets_directional_cutoffs():
+    """Successful local shutdown records only the affected directions."""
+    cs, peer = socket.socketpair()
+    client = tcp.Client(ha=("127.0.0.1", 6101))
+    client.cs = cs
+    client.accepted = True
+
+    try:
+        client.shutdownReceive()
+        assert client.cutoff is True
+        assert client.txCutoff is False
+
+        client.shutdownSend()
+        assert client.cutoff is True
+        assert client.txCutoff is True
+    finally:
+        client.close()
+        peer.close()
+
+
+@pytest.mark.parametrize("endpointCls", (tcp.Client, serving.Remoter))
+def test_tcp_service_close_waits_for_egress_and_peer_eof(endpointCls):
+    """Raw recurrent close drains output before awaiting peer EOF."""
+    cs = Mock(spec=socket.socket)
+    if endpointCls is tcp.Client:
+        endpoint = tcp.Client(ha=("127.0.0.1", 6101))
+        endpoint.cs = cs
+        endpoint.accepted = True
+    else:
+        endpoint = serving.Remoter(ha=("127.0.0.1", 6101),
+                                   ca=("127.0.0.1", 6102),
+                                   cs=cs)
+
+    endpoint.tx(b"pending")
+    assert endpoint.serviceClose() is False
+    assert endpoint.txCutoff is False
+    cs.shutdown.assert_not_called()
+
+    endpoint.txbs.clear()  # owner reports egress settled
+    assert endpoint.serviceClose() is False
+    assert endpoint.txCutoff is True
+    cs.shutdown.assert_called_once_with(socket.SHUT_WR)
+
+    endpoint.cutoff = True  # peer EOF completes receive direction
+    assert endpoint.serviceClose() is True
+    assert endpoint.cs is None
+    cs.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("endpointCls", (tcp.Client, serving.Remoter))
+def test_tcp_service_close_records_shutdown_error(endpointCls):
+    """Raw recurrent close exposes a terminal write-shutdown failure."""
+    cs = Mock(spec=socket.socket)
+    failure = OSError(errno.ENOTCONN, "not connected")
+    cs.shutdown.side_effect = failure
+    if endpointCls is tcp.Client:
+        endpoint = tcp.Client(ha=("127.0.0.1", 6101))
+        endpoint.cs = cs
+        endpoint.accepted = True
+    else:
+        endpoint = serving.Remoter(ha=("127.0.0.1", 6101),
+                                   ca=("127.0.0.1", 6102),
+                                   cs=cs)
+
+    with pytest.raises(OSError) as excinfo:
+        endpoint.serviceClose()
+
+    assert excinfo.value is failure
+    assert endpoint.error is failure
+    assert endpoint.cutoff is False
+    assert endpoint.txCutoff is True
+    assert endpoint.cs is cs
 
 
 def test_client_tracks_terminal_send_separately():
