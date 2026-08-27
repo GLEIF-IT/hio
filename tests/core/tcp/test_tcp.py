@@ -1260,9 +1260,14 @@ def test_tls_shutdown_starts_recurrent_close(endpointCls, methodName):
 
 @pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
 @pytest.mark.parametrize("methodName", ("shutdownSend", "shutdownReceive"))
-def test_tls_directional_shutdown_surfaces_unwrap_error(endpointCls,
-                                                         methodName):
-    """Directional TLS shutdown does not hide a close_notify failure."""
+def test_tls_shutdown_aliases_propagate_unwrap_error(endpointCls,
+                                                      methodName):
+    """Propagate unwrap failures through the TLS shutdown aliases.
+
+    shutdownSend and shutdownReceive both route through shutdown into the
+    full TLS close_notify and unwrap exchange; neither performs a raw socket
+    half-close.
+    """
     cs = Mock(spec=ssl.SSLSocket)
     failure = ssl.SSLError(ssl.SSL_ERROR_SSL, "fatal close")
     cs.unwrap.side_effect = failure
