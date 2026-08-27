@@ -59,6 +59,13 @@ class VersionError(ValidationError):
         raise VersionError("error message")
     """
 
+
+class TransmitClosedError(HioError):
+    """
+    Attempt to enqueue output after transmit became terminal.
+    """
+
+
 class OglerError(HioError):
     """
     Error using or configuring Ogler
