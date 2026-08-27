@@ -1024,6 +1024,9 @@ class RemoterTls(Remoter):
             if self.wl:  # log over the wire rx
                 self.wl.writeRx(data, who=self.cs.getpeername())
 
+            if self.refreshable:
+                self.refresh()
+
         else:  # data empty so connection closed on other end
             self.cutoff = True
             self.txCutoff = True
@@ -1063,6 +1066,9 @@ class RemoterTls(Remoter):
         if result:
             if self.wl:
                 self.wl.writeTx(data[:result], who=self.cs.getpeername())
+
+            if self.refreshable:
+                self.refresh()
 
         return result
 
