@@ -903,11 +903,15 @@ def makeTlsEndpoint(endpointCls, cs):
 
 
 @pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
-def test_tls_receive_retries_typed_want(endpointCls):
+@pytest.mark.parametrize(
+    "errorCls, errno_",
+    ((ssl.SSLWantReadError, ssl.SSL_ERROR_WANT_READ),
+     (ssl.SSLWantWriteError, ssl.SSL_ERROR_WANT_WRITE)),
+)
+def test_tls_receive_retries_typed_want(endpointCls, errorCls, errno_):
     """A typed TLS WANT condition is retryable, not terminal."""
     cs = Mock(spec=ssl.SSLSocket)
-    cs.recv.side_effect = ssl.SSLWantReadError(
-        ssl.SSL_ERROR_WANT_READ, "want read")
+    cs.recv.side_effect = errorCls(errno_, "retry receive")
     endpoint = makeTlsEndpoint(endpointCls, cs)
 
     assert endpoint.receive() is None
@@ -917,11 +921,15 @@ def test_tls_receive_retries_typed_want(endpointCls):
 
 
 @pytest.mark.parametrize("endpointCls", (tcp.ClientTls, serving.RemoterTls))
-def test_tls_send_retries_typed_want(endpointCls):
+@pytest.mark.parametrize(
+    "errorCls, errno_",
+    ((ssl.SSLWantReadError, ssl.SSL_ERROR_WANT_READ),
+     (ssl.SSLWantWriteError, ssl.SSL_ERROR_WANT_WRITE)),
+)
+def test_tls_send_retries_typed_want(endpointCls, errorCls, errno_):
     """A typed TLS WANT condition preserves output for a later cycle."""
     cs = Mock(spec=ssl.SSLSocket)
-    cs.send.side_effect = ssl.SSLWantWriteError(
-        ssl.SSL_ERROR_WANT_WRITE, "want write")
+    cs.send.side_effect = errorCls(errno_, "retry send")
     endpoint = makeTlsEndpoint(endpointCls, cs)
     endpoint.tx(b"pending")
 
@@ -1094,6 +1102,66 @@ def test_tls_local_close_preserves_real_pending_plaintext(version,
         assert clientDone is True
         assert remoterDone is True
         assert bytes(receiver.rxbs) == message
+    finally:
+        closeTlsPair(server, client, remoter)
+
+
+@pytest.mark.parametrize("initiatorName", ("client", "remoter"))
+def test_tls_close_drains_data_arriving_after_want_read(initiatorName):
+    """Local close preserves TLS 1.3 data sent after unwrap wants read."""
+    server, client, remoter = openTlsPair(ssl.TLSVersion.TLSv1_3)
+    initiator = client if initiatorName == "client" else remoter
+    peer = remoter if initiatorName == "client" else client
+    message = b"plaintext sent after local close_notify" * 32
+
+    try:
+        assert initiator.serviceClose() is False
+        assert initiator._closing is True
+        assert initiator._closeWantRead is True
+
+        for _ in range(1000):
+            peer.serviceReceives()
+            if peer.cutoff:
+                break
+            time.sleep(0.001)
+        assert peer.cutoff is True  # peer observed initiator close_notify
+        assert peer.txCutoff is False
+
+        peer.tx(message)
+        for _ in range(1000):
+            peer.serviceSends()
+            if not peer.txbs:
+                break
+            time.sleep(0.001)
+        assert not peer.txbs
+
+        for _ in range(1000):
+            assert initiator.serviceClose() is False
+            if bytes(initiator.rxbs) == message:
+                break
+            time.sleep(0.001)
+        assert bytes(initiator.rxbs) == message
+        assert initiator.error is None
+        assert peer.error is None
+
+        initiatorDone = False
+        peerDone = False
+        for _ in range(1000):
+            if not peerDone:
+                peerDone = peer.serviceClose()
+            if not initiatorDone:
+                initiatorDone = initiator.serviceClose()
+            if initiatorDone and peerDone:
+                break
+            time.sleep(0.001)
+
+        assert initiatorDone is True
+        assert peerDone is True
+        assert initiator.serviceClose() is True
+        assert peer.serviceClose() is True
+        assert initiator.cs is None
+        assert peer.cs is None
+        assert bytes(initiator.rxbs) == message
     finally:
         closeTlsPair(server, client, remoter)
 
