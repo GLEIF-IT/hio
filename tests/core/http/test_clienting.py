@@ -235,6 +235,8 @@ def mockRedirectingServiceTls(server):
     server.serviceConnects()
     if server.ixes:
         server.serviceReceivesAllIx()
+        if not server.ixes:  # truthful TLS truncation removes the connection
+            return
 
         ixClient = list(server.ixes.values())[0]
         msgIn = bytes(ixClient.rxbs)
@@ -2261,8 +2263,8 @@ def test_client_redirect_different_servers_tls():
 
     beta.requests.append(request)
 
-    while (not alpha.ixes or beta.requests or
-           beta.connector.txbs or not beta.respondent.ended):
+    while (beta.requests or beta.connector.txbs or
+           not beta.respondent.ended):
         mockRedirectingServiceTls(alpha)
         mockRedirectedService(gamma)
         time.sleep(0.05)

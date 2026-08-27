@@ -383,7 +383,8 @@ class Server(Acceptor):
         try:
             self.ixes[ca].serviceReceives()
         except OSError as ex:
-            logger.error("Closing incoming socket on %s.\n%s\n", ix.cs.getpeername(), ex)
+            # use stable ca because receive may already have closed .cs
+            logger.error("Closing incoming socket on %s.\n%s\n", ca, ex)
             self.removeIx(ca=ca)  # also closes ix
 
 
@@ -395,7 +396,8 @@ class Server(Acceptor):
             try:
                 ix.serviceReceives()
             except OSError as ex:
-                logger.error("Closing incoming socket on %s.\n%s\n", ix.cs.getpeername(), ex)
+                # use stable ca because receive may already have closed .cs
+                logger.error("Closing incoming socket on %s.\n%s\n", ca, ex)
                 self.removeIx(ca=ca)  # also closes ix
 
 
@@ -954,7 +956,14 @@ class RemoterTls(Remoter):
         """
         self.cs = self.context.wrap_socket(self.cs,
                                            server_side=True,
-                                           do_handshake_on_connect=False)
+                                           do_handshake_on_connect=False,
+                                           suppress_ragged_eofs=False)
+
+
+    def _receiveClosed(self):
+        """Record a clean TLS close of the receive direction."""
+        self.cutoff = True  # close_notify authenticates peer receive EOF
+        return bytes()
 
 
     def handshake(self):
@@ -1010,26 +1019,30 @@ class RemoterTls(Remoter):
         """
         try:
             data = self.cs.recv(self.bs)
-        except OSError as ex:  # ssl.SSLError is a subtype of OSError
-            # ex.args[0] == ex.errno for better compat
-            # the value of a given errno.XXXXX may be different on each os
-            if  ex.args[0] in (ssl.SSL_ERROR_WANT_READ, ssl.SSL_ERROR_WANT_WRITE):
-                return None  # blocked waiting for data
-            elif ex.args[0] in (errno.ECONNRESET,
-                                errno.ENETRESET,
-                                errno.ENETUNREACH,
-                                errno.EHOSTUNREACH,
-                                errno.ENETDOWN,
-                                errno.EHOSTDOWN,
-                                errno.ETIMEDOUT,
-                                errno.ECONNREFUSED,
-                                ssl.SSLEOFError):
-                self.cutoff = True
-                self.txCutoff = True
-                return bytes()  # data empty
-            else:
-                logger.error("Unexpected error on receive on %s.\n%s\n", self.cs.getpeername(), ex)
-                raise  # re-raise
+        except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+            return None  # nonblocking TLS operation must retry later
+        except ssl.SSLZeroReturnError:
+            return self._receiveClosed()  # close_notify received cleanly
+        except ssl.SSLEOFError as ex:  # raw EOF without close_notify
+            self.cutoff = True
+            self.txCutoff = True
+            self.error = ex
+            self.close()
+            raise
+        except ssl.SSLSyscallError as ex:  # terminal OpenSSL socket failure
+            self.cutoff = True
+            self.txCutoff = True
+            self.error = ex
+            self.close()
+            raise
+        except OSError as ex:
+            if ex.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return None  # nonblocking socket must retry later
+            self.cutoff = True  # any other socket failure is terminal
+            self.txCutoff = True
+            self.error = ex
+            self.close()
+            raise
 
         if data:  # connection open
             if self.wl:  # log over the wire rx
@@ -1038,9 +1051,8 @@ class RemoterTls(Remoter):
             if self.refreshable:
                 self.refresh()
 
-        else:  # data empty so connection closed on other end
-            self.cutoff = True
-            self.txCutoff = True
+        else:  # empty TLS read means peer sent close_notify
+            return self._receiveClosed()
 
         return data
 
