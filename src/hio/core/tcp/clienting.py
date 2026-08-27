@@ -252,11 +252,18 @@ class Client(tyming.Tymee):
         """
         Shutdown connected socket .cs
         """
+        shut = False  # only record cutoff after successful shutdown
         if self.cs:
             try:
                 self.cs.shutdown(how)  # shutdown socket
+                shut = True
             except OSError as ex:
                 pass
+
+        if shut and how in (socket.SHUT_RD, socket.SHUT_RDWR):
+            self.cutoff = True
+        if shut and how in (socket.SHUT_WR, socket.SHUT_RDWR):
+            self.txCutoff = True
 
 
     def shutdownSend(self):
@@ -279,6 +286,33 @@ class Client(tyming.Tymee):
                 self.shutdown(how=socket.SHUT_RD)  # shutdown socket
             except OSError as ex:
                 pass
+
+
+    def serviceClose(self):
+        """
+        Service recurrent socket close.
+        Returns True when closed, False when service must retry.
+        """
+        if not self.cs:
+            return True
+
+        if self.txbs and not self.txCutoff:
+            return False  # caller must settle output before write shutdown
+
+        if not self.txCutoff:
+            try:
+                self.cs.shutdown(socket.SHUT_WR)
+            except OSError as ex:
+                self.txCutoff = True  # failed shutdown is terminal for writes
+                self.error = ex
+                raise
+            self.txCutoff = True
+
+        if not self.cutoff:
+            return False  # wait for peer EOF after write shutdown
+
+        self.close()
+        return self.cs is None
 
 
     def close(self):
@@ -612,10 +646,10 @@ class ClientTls(Client):
 
     def close(self):
         """
-        Shutdown and close connected socket .cs
+        Force close connected TLS socket .cs
         """
         if self.cs:
-            self.shutdown()
+            # force close bypasses the recurrent TLS close_notify exchange
             self.cs.close()  #close socket
             self.cs = None
             self.accepted = False

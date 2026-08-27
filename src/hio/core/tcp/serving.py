@@ -725,6 +725,33 @@ class Remoter(tyming.Tymee):
                 pass
 
 
+    def serviceClose(self):
+        """
+        Service recurrent socket close.
+        Returns True when closed, False when service must retry.
+        """
+        if not self.cs:
+            return True
+
+        if self.txbs and not self.txCutoff:
+            return False  # caller must settle output before write shutdown
+
+        if not self.txCutoff:
+            try:
+                self.cs.shutdown(socket.SHUT_WR)
+            except OSError as ex:
+                self.txCutoff = True  # failed shutdown is terminal for writes
+                self.error = ex
+                raise
+            self.txCutoff = True
+
+        if not self.cutoff:
+            return False  # wait for peer EOF after write shutdown
+
+        self.close()
+        return self.cs is None
+
+
     def close(self):
         """
         Shutdown and close connected socket .cs
@@ -941,10 +968,10 @@ class RemoterTls(Remoter):
 
     def close(self):
         """
-        Shutdown and close connected socket .cs
+        Force close connected TLS socket .cs
         """
         if self.cs:
-            self.shutdown()
+            # force close bypasses the recurrent TLS close_notify exchange
             self.cs.close()  #close socket
             self.cs = None
             self.connected = False
