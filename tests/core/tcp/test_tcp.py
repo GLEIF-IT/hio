@@ -1211,11 +1211,13 @@ def test_tls_recurrent_close_retries_want_and_drains_plaintext(endpointCls):
         ssl.SSLWantReadError(ssl.SSL_ERROR_WANT_READ, "want read"),
         raw,
     ]
-    cs.pending.side_effect = [7, 0, 0]
+    cs.pending.side_effect = [7, 0, 0, 0]
+    cs.version.return_value = "TLSv1.3"
     cs.recv.side_effect = [
         b"pending",
         ssl.SSLWantReadError(ssl.SSL_ERROR_WANT_READ, "want read"),
         ssl.SSLWantReadError(ssl.SSL_ERROR_WANT_READ, "want read"),
+        ssl.SSLZeroReturnError(ssl.SSL_ERROR_ZERO_RETURN, "close notify"),
     ]
     endpoint = makeTlsEndpoint(endpointCls, cs)
 
@@ -1225,7 +1227,10 @@ def test_tls_recurrent_close_retries_want_and_drains_plaintext(endpointCls):
     assert bytes(endpoint.rxbs) == b"pending"
     # The second recurrence reaches WANT_READ without treating it as failure.
     assert endpoint.serviceClose() is False
-    # The third recurrence services that read path and completes unwrap.
+    # A no-progress receive must not retry unwrap before peer close_notify.
+    assert endpoint.serviceClose() is False
+    assert cs.unwrap.call_count == 2
+    # The fourth recurrence consumes close_notify and completes unwrap.
     assert endpoint.serviceClose() is True
     assert endpoint.serviceClose() is True
     assert endpoint.cutoff is True

@@ -751,6 +751,8 @@ class ClientTls(Client):
             self._serviceCloseReceives()  # drain data racing local close
         elif self._closeWantRead:
             self._serviceCloseReceives()  # drain data before retrying unwrap
+            if not self.cutoff:
+                return False  # wait until receive consumes peer close_notify
 
         try:
             raw = self.cs.unwrap()
