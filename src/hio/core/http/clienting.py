@@ -858,9 +858,12 @@ class Client():
 
     def reopen(self):
         """
-        Return result of .connector.reopen()
+        Open a new transport generation and reset its response parser.
         """
-        return self.connector.reopen()
+        opened = self.connector.reopen()
+        if opened and self.respondent is not None:
+            self.respondent.reopen()
+        return opened
 
 
     def close(self):
@@ -1042,12 +1045,14 @@ class Client():
 
                 self.secured = secured
                 self.connector = connector
-                self.connector.reopen()
+                opened = self.connector.reopen()
                 self.requester.reinit(hostname=hostname,
                                       port=port,
                                       scheme=scheme)
                 self.respondent.reinit(msg=self.connector.rxbs,
                                        method=method)
+                if opened:
+                    self.respondent.reopen()
 
             qargs = dict()
             qargs, query = httping.updateQargsQuery(qargs, query)
@@ -1149,7 +1154,7 @@ class Client():
 
             if self.connector.reconnectable:  # useful for server sent event stream
                 if self.connector.tymeout > 0.0 and self.connector.tymer.expired:  # timed out
-                    self.connector.reopen()
+                    self.reopen()
                     if self.respondent.evented:
                         duration = float(self.respondent.retry) / 1000.0 # convert to seconds
                     else:
@@ -1335,4 +1340,3 @@ class ClientDoer(doing.Doer):
     def exit(self):
         """"""
         self.client.close()
-
