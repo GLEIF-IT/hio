@@ -937,6 +937,19 @@ class Parsent(object):
         """
         self.closed = True
 
+    def reopen(self):
+        """
+        Reset terminal parser state for a new transport generation.
+        """
+        self.started = False
+        self.headed = False
+        self.bodied = False
+        self.ended = False
+        self.closed = False
+        self.errored = False
+        self.error = None
+        self.makeParser()  # set up for new msg
+
     def checkPersisted(self):
         """
         Checks headers to determine if connection should be kept open until
@@ -1051,4 +1064,3 @@ class Parsent(object):
                                        object_pairs_hook=dict)
             except ValueError as ex:
                 self.data = None
-
