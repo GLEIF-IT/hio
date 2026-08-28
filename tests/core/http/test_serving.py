@@ -24,6 +24,69 @@ tlsdirpath = os.path.dirname(
 certdirpath = os.path.join(tlsdirpath, 'tls', 'certs')
 
 
+def _requestant_waiting_for_chunk_body():
+    """Create a real Requestant paused after parsing chunked request headers."""
+    remoter = tcp.Remoter(ha=("127.0.0.1", 6101),
+                          ca=("127.0.0.1", 6102),
+                          cs=None)
+    requestant = serving.Requestant(
+        msg=bytearray(b"POST / HTTP/1.1\r\n"
+                      b"Host: localhost\r\n"
+                      b"Transfer-Encoding: chunked\r\n\r\n"),
+        remoter=remoter)
+    requestant.parse()
+    assert requestant.headed
+    assert not requestant.bodied
+    assert requestant.parser is not None
+    return requestant
+
+
+def _service_requestant(requestant, limit=8):
+    """Drive a finite request parser without hiding a terminal EOF stall."""
+    for _ in range(limit):
+        requestant.parse()
+        if requestant.parser is None:
+            return
+    raise AssertionError("request parser did not settle")
+
+
+def test_requestant_chunked_eof_consumes_terminal_zero_chunk():
+    """Buffered request chunks remain incomplete until zero framing is read."""
+    requestant = _requestant_waiting_for_chunk_body()
+    requestant.msg.extend(b"4\r\nWiki\r\n0\r\n\r\n")
+    requestant.close()
+
+    _service_requestant(requestant)
+
+    assert requestant.closed
+    assert requestant.ended
+    assert not requestant.errored
+    assert requestant.bodied
+    assert requestant.body == b"Wiki"
+    assert not requestant.msg
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"4\r\nWiki\r\n",
+        b"4\r\nWiki\r\n0\r\nTrailer: value\r\n",
+    ],
+)
+def test_requestant_chunked_eof_rejects_incomplete_terminator(body):
+    """EOF after data cannot replace the zero chunk and complete trailers."""
+    requestant = _requestant_waiting_for_chunk_body()
+    requestant.msg.extend(body)
+    requestant.close()
+
+    _service_requestant(requestant)
+
+    assert requestant.closed
+    assert requestant.ended
+    assert requestant.errored
+    assert "closed unexpectedly" in requestant.error.lower()
+
+
 def test_responder_content_length_closes_producer():
     """Content-Length completion closes rather than resumes the producer."""
     # Responder writes outbound HTTP bytes to an accepted TCP/TLS connection
