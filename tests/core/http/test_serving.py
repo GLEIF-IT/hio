@@ -87,6 +87,45 @@ def test_requestant_chunked_eof_rejects_incomplete_terminator(body):
     assert "closed unexpectedly" in requestant.error.lower()
 
 
+@pytest.mark.parametrize(
+    "initial, buffered, expected_body",
+    [
+        (b"",
+         b"GET /buffered HTTP/1.1\r\nHost: localhost\r\n\r\n",
+         b""),
+        (b"GET /buffered HTTP/1.1\r\n",
+         b"Host: localhost\r\n\r\n",
+         b""),
+        (b"POST /buffered HTTP/1.1\r\nHost: localhost\r\n"
+         b"Content-Length: 4\r\n\r\n",
+         b"test",
+         b"test"),
+    ],
+)
+def test_requestant_consumes_complete_buffered_framing_before_eof(
+        initial, buffered, expected_body):
+    """Complete start-line, headers, or fixed body buffered at EOF are valid."""
+    remoter = tcp.Remoter(ha=("127.0.0.1", 6101),
+                          ca=("127.0.0.1", 6102),
+                          cs=None)
+    requestant = serving.Requestant(msg=bytearray(initial), remoter=remoter)
+    requestant.parse()
+    assert requestant.parser is not None
+
+    requestant.msg.extend(buffered)
+    requestant.close()
+    _service_requestant(requestant)
+
+    assert requestant.closed
+    assert requestant.ended
+    assert not requestant.errored
+    assert requestant.headed
+    assert requestant.bodied
+    assert requestant.path == "/buffered"
+    assert requestant.body == expected_body
+    assert not requestant.msg
+
+
 def test_responder_content_length_closes_producer():
     """Content-Length completion closes rather than resumes the producer."""
     # Responder writes outbound HTTP bytes to an accepted TCP/TLS connection
