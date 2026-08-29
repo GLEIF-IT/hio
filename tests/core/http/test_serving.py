@@ -83,7 +83,59 @@ def test_wsgi_server_does_not_admit_empty_eof():
         calls.append(environ)
         return []
 
-    with tcp.openServer(ha=("127.0.0.1", 0)) as servant:
+    with tcp.openServer(ha=("127.0.0.1", 0), tymeout=0.0) as servant:
+        servant.eha = servant.ha
+        with tcp.openClient(ha=servant.ha) as client:
+            for _ in range(100):
+                client.serviceConnect()
+                servant.serviceConnects()
+                if client.connected and client.ca in servant.ixes:
+                    break
+                time.sleep(0.01)
+            assert client.connected
+            assert client.ca in servant.ixes
+
+            server = serving.Server(app=app,
+                                    servant=servant,
+                                    ha=servant.ha)
+            server.serviceConnects()
+            remoter = servant.ixes[client.ca]
+            requestant = server.reqs[client.ca]
+
+            # Receive discovers fresh EOF after serviceConnects admitted the
+            # Remoter but before serviceReqs advances its Requestant.
+            client.shutdownSend()
+            for _ in range(100):
+                servant.serviceReceivesAllIx()
+                if remoter.cutoff:
+                    break
+                time.sleep(0.01)
+            assert remoter.cutoff
+
+            server.serviceReqs()
+
+            assert requestant.closed
+            assert requestant.parser is None
+            assert requestant.ended
+            assert not requestant.errored
+            assert not requestant.headed
+            assert not calls
+            assert not server.reps
+
+
+def test_wsgi_server_does_not_rearm_closed_request_with_pipeline_suffix():
+    """EOF forbids admission of a buffered pipelined request suffix."""
+    calls = []
+
+    def app(environ, start_response):
+        calls.append(environ["PATH_INFO"])
+        start_response("200 OK", [("Content-Length", "0")])
+        return []
+
+    messages = (b"GET /one HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                b"GET /two HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
+    with tcp.openServer(ha=("127.0.0.1", 0), tymeout=0.0) as servant:
         servant.eha = servant.ha
         with tcp.openClient(ha=servant.ha) as client:
             for _ in range(100):
@@ -99,20 +151,46 @@ def test_wsgi_server_does_not_admit_empty_eof():
                                     servant=servant,
                                     ha=servant.ha)
             remoter = servant.ixes[client.ca]
-            requestant = serving.Requestant(msg=remoter.rxbs,
-                                             remoter=remoter)
-            # Model transport EOF before the client sends an HTTP start line.
-            requestant.close()
-            server.reqs[client.ca] = requestant
 
+            # Queue both requests before the client half-closes its send side.
+            client.tx(messages)
+            for _ in range(100):
+                client.serviceSends()
+                servant.serviceReceivesAllIx()
+                if not client.txbs and bytes(remoter.rxbs) == messages:
+                    break
+                time.sleep(0.01)
+            assert not client.txbs
+            assert bytes(remoter.rxbs) == messages
+
+            # Complete the connection-admission phase before receive finds EOF.
+            server.serviceConnects()
+            requestant = server.reqs[client.ca]
+            client.shutdownSend()
+            for _ in range(100):
+                servant.serviceReceivesAllIx()
+                if remoter.cutoff:
+                    break
+                time.sleep(0.01)
+            assert remoter.cutoff
+
+            # The remaining recurrence phases settle only the first request.
             server.serviceReqs()
-
+            server.serviceReps()
+            assert requestant.closed
+            assert requestant.path == "/one"
+            assert requestant.persisted
             assert requestant.parser is None
-            assert requestant.ended
-            assert not requestant.errored
-            assert not requestant.headed
-            assert not calls
-            assert not server.reps
+            assert requestant.msg.startswith(b"GET /two")
+            assert calls == ["/one"]
+
+            # Direct later servicing cannot rearm or admit the suffix at EOF.
+            server.serviceReqs()
+            server.serviceReps()
+            assert requestant.parser is None
+            assert requestant.path == "/one"
+            assert requestant.msg.startswith(b"GET /two")
+            assert calls == ["/one"]
 
 
 def test_requestant_chunked_eof_consumes_terminal_zero_chunk():
