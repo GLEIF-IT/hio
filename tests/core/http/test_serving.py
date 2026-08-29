@@ -12,7 +12,7 @@ from hio import help
 from hio.help import helping
 from hio.base import tyming, doing
 from hio.core import http, tcp
-from hio.core.http import serving
+from hio.core.http import httping, serving
 
 
 logger = help.ogler.getLogger()
@@ -230,6 +230,106 @@ def test_responder_content_length_closes_producer():
     assert events == ["closed"]
     assert incomer.txbs.endswith(b"body")
     assert incomer.txbs.count(b"body") == 1
+
+
+def _make_chunked_responder(values=(b"body", b"later")):
+    """Build a production Responder over a real Remoter transmit queue."""
+    remoter = tcp.Remoter(ha=("127.0.0.1", 6101),
+                          ca=("127.0.0.1", 6102),
+                          cs=None)
+
+    def app(environ, start_response):
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return values
+
+    responder = serving.Responder(incomer=remoter,
+                                  app=app,
+                                  environ={},
+                                  chunkable=True)
+    return responder, remoter
+
+
+@pytest.mark.parametrize("after_output", [False, True])
+def test_responder_incomplete_close_is_failure(after_output):
+    """Administrative close cannot impersonate normal WSGI exhaustion."""
+    # Arrange: cover closure before response start and after partial output.
+    responder, remoter = _make_chunked_responder()
+    if after_output:
+        responder.service()
+    before = bytes(remoter.txbs)
+
+    # Act: administratively close the incomplete response.
+    responder.close()
+
+    # Assert: teardown records failure without synthesizing terminal framing.
+    assert responder.closed
+    assert responder.errored
+    assert isinstance(responder.error, httping.PrematureClosure)
+    assert not responder.ended
+    assert bytes(remoter.txbs) == before
+    assert not remoter.txbs.endswith(b"0\r\n\r\n")
+
+    # Act and assert: repeated close retains the cause and byte boundary.
+    error = responder.error
+    responder.close()
+    assert responder.error is error
+    assert bytes(remoter.txbs) == before
+
+
+def test_responder_abort_retains_first_failure():
+    """Abort is idempotent and preserves its first causal exception."""
+    # Arrange: partially emit a response before transport failure.
+    responder, remoter = _make_chunked_responder()
+    responder.service()
+    before = bytes(remoter.txbs)
+    error = BrokenPipeError("response transport closed")
+
+    # Act: abort with the failure that ended production.
+    responder.abort(error)
+
+    # Assert: failure settles without claiming completion or adding bytes.
+    assert responder.closed
+    assert responder.errored
+    assert responder.error is error
+    assert not responder.ended
+    assert bytes(remoter.txbs) == before
+
+    # Act and assert: a later abort cannot obscure the first cause.
+    responder.abort(RuntimeError("later failure"))
+    assert responder.error is error
+    assert bytes(remoter.txbs) == before
+
+
+def test_responder_failure_cannot_be_reused():
+    """Reset accepts only a normally completed responder generation."""
+    # Arrange: settle the response generation as failed.
+    responder, _ = _make_chunked_responder()
+    responder.close()
+
+    # Act and assert: persistent reuse cannot reclassify that failure.
+    with pytest.raises(RuntimeError, match="without normal completion"):
+        responder.reset(environ={"request": "next"}, chunkable=True)
+
+
+def test_responder_normal_completion_remains_successful():
+    """Normal exhaustion still emits one terminal chunk before close."""
+    # Arrange: use a finite producer with one body chunk.
+    responder, remoter = _make_chunked_responder(values=(b"body",))
+
+    # Act: advance once for the body and once to observe exhaustion.
+    responder.service()
+    responder.service()
+
+    # Assert: exhaustion owns successful terminal framing.
+    assert responder.ended
+    assert not responder.closed
+    assert remoter.txbs.endswith(b"4\r\nbody\r\n0\r\n\r\n")
+
+    # Act and assert: later close preserves success and adds no framing.
+    responder.close()
+    assert responder.ended
+    assert responder.closed
+    assert remoter.txbs.count(b"0\r\n\r\n") == 1
 
 
 def test_wsgi_server_reuse_resets_request_scoped_response_state():

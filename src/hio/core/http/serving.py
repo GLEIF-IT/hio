@@ -287,6 +287,8 @@ class Responder():
         self.chunked = False  # True if should send in chunks
         self.ended = False  # True if response body completely sent
         self.closed = False  # True if connection closed by far side
+        self.errored = False  # True if response production failed
+        self.error = None  # retained response production failure
         self.iterator = None  # iterator on application body
         self.status = status
         self.headers = help.Hict()  # headers
@@ -296,12 +298,29 @@ class Responder():
 
 
     def close(self):
+        """Close this response generation.
+
+        Preserve prior normal completion. Otherwise settle unfinished
+        production as failure without emitting completion framing.
         """
-        Close any resources
-        """
-        if self.started and not self.closed and not self.ended:
-            self.write(b'')  # in case chunked send empty chunk to terminate
-        self.ended = True
+        if self.ended:
+            self.closed = True
+            return
+
+        self.abort(httping.PrematureClosure(
+            "Response production closed before iterator exhaustion"))
+
+
+    def abort(self, error):
+        """Settle response production as a terminal failure."""
+        if self.ended:
+            self.closed = True
+            return
+
+        if not self.errored:
+            self.errored = True
+            self.error = error
+
         self.closed = True
 
 
@@ -317,6 +336,10 @@ class Responder():
         """
         Reset attributes for another request-response
         """
+        if not self.ended or self.errored or self.closed:
+            raise RuntimeError(
+                "Cannot reuse a responder without normal completion")
+
         self.environ = environ
 
         if chunkable is not None:
@@ -326,6 +349,9 @@ class Responder():
         self.headed = False
         self.chunked = False
         self.ended = False
+        self.closed = False
+        self.errored = False
+        self.error = None
         self.iterator = None
         self.status = "200 OK"
         self.headers = help.Hict()
