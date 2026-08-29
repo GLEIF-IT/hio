@@ -194,7 +194,7 @@ def test_respondent_reopen_resets_parser_generation():
 
 
 def test_client_reopen_resets_parser_generation():
-    """Manual reopen rearms parsing after opening a real new socket."""
+    """A legal manual reopen resets parsing and discards old receive bytes."""
     with tcp.openServer(ha=("127.0.0.1", 0)) as server:
         # Acceptor does not refresh .eha after binding an ephemeral port.
         server.eha = server.ha
@@ -203,14 +203,52 @@ def test_client_reopen_resets_parser_generation():
             _service_client_connection(client, server)
             old_socket = client.connector.cs
             old_parser = client.respondent.parser
+
+            # Leave accepted old-generation bytes unclaimed by any exchange.
+            remoter = server.ixes[client.connector.ca]
+            remoter.tx(b"stale-old-generation")
+            for _ in range(100):
+                remoter.serviceSends()
+                client.connector.serviceReceives()
+                if client.connector.rxbs:
+                    break
+                time.sleep(0.01)
+            assert client.connector.rxbs == b"stale-old-generation"
             client.respondent.close()
 
-            assert client.reopen()
+            assert client.reopen()  # should clear stale bytes on manual reopen
 
             assert old_socket.fileno() == -1
             assert client.connector.cs is not old_socket
+            assert not client.connector.rxbs
             assert client.respondent.parser is not old_parser
             assert not client.respondent.closed
+
+
+def test_client_reopen_rejects_active_exchange():
+    """Manual reopen cannot discard an unsettled request and response."""
+    with tcp.openServer(ha=("127.0.0.1", 0)) as server:
+        server.eha = server.ha
+        with clienting.openClient(hostname=server.ha[0],
+                                  port=server.ha[1]) as client:
+            _service_client_connection(client, server)
+
+            # Queue but do not service the request, keeping the exchange active.
+            client.transmit(method="GET", path="/active")
+            old_socket = client.connector.cs
+            old_parser = client.respondent.parser
+            old_request = bytes(client.connector.txbs)
+
+            with pytest.raises(RuntimeError, match="response is still active"):
+                client.reopen()
+
+            # Rejection must leave every active-generation owner unchanged.
+            assert client.waited
+            assert client.connector.cs is old_socket
+            assert old_socket.fileno() != -1
+            assert client.connector.connected
+            assert client.respondent.parser is old_parser
+            assert bytes(client.connector.txbs) == old_request
 
 
 def test_client_automatic_reconnect_resets_parser_generation():

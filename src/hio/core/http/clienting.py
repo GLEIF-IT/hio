@@ -863,8 +863,14 @@ class Client():
         """
         Open a new transport generation and reset its response parser.
         """
+        if (self.waited and self.respondent is not None and
+                not self.respondent.ended):
+            raise RuntimeError(
+                "Cannot reopen while an HTTP response is still active")
+
         opened = self.connector.reopen()
         if opened and self.respondent is not None:
+            self.connector.clearRxbs()
             self.respondent.reopen()
         return opened
 
