@@ -860,6 +860,11 @@ class Server():
         Service pending requestants
         """
         for ca, requestant in list(self.reqs.items()):
+            ix = self.servant.ixes.get(ca)
+            if ix is not None and ix.cutoff:
+                # Receive may discover EOF after serviceConnects this recurrence.
+                requestant.close()
+
             if requestant.parser:
                 try:
                     requestant.parse()
@@ -915,7 +920,7 @@ class Server():
             if responder.ended:
                 requestant = self.reqs[ca]
                 if requestant.persisted:
-                    if requestant.parser is None:  # reuse
+                    if requestant.parser is None and not requestant.closed:  # reuse
                         requestant.makeParser()  # resets requestant parser
                 else:  # not persistent so close and remove requestant and responder
                     ix = self.servant.ixes[ca]
