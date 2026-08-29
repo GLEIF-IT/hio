@@ -37,6 +37,8 @@ class Requestant(httping.Parsent):
     Parses request msg
     """
 
+    EmptyEofIsError = False
+
     def __init__(self, remoter=None, **kwa):
         """
         Initialize Instance
@@ -805,6 +807,9 @@ class Server():
                     if requestant.errored:  # parse may swallow error but set .errored and .error
                         sys.stderr.write(requestant.error)
                         self.closeConnection(ca)
+                        continue
+
+                    if not requestant.headed:  # clean EOF with no HTTP request
                         continue
 
                     logger.info("Parsed Request: %s %s %s", requestant.method,

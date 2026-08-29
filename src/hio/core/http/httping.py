@@ -876,6 +876,8 @@ class Parsent(object):
     """
     Base class for objects that parse HTTP messages
     """
+    EmptyEofIsError = True
+
     def __init__(self,
                  msg=None,
                  dictable=None,
@@ -992,7 +994,6 @@ class Parsent(object):
         self.headed = False
         self.bodied = False
         self.ended = False
-        self.closed = False
         self.errored = False
         self.error = None
 
@@ -1000,6 +1001,14 @@ class Parsent(object):
             if self.msg:
                 self.started = True
                 break
+            if self.closed:
+                if self.EmptyEofIsError:
+                    self.errored = True
+                    self.error = "Connection closed before HTTP message"
+                self.ended = True
+                self.started = False
+                (yield True)
+                return
             (yield None)
 
         try:

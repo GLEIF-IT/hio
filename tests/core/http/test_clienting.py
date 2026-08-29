@@ -168,6 +168,25 @@ def _service_respondent(respondent, limit=8):
     raise AssertionError("response parser did not settle")
 
 
+@pytest.mark.parametrize("started", [False, True])
+def test_respondent_empty_eof_settles_as_error(started):
+    """Empty EOF remains terminal before or after the parser first runs."""
+    respondent = clienting.Respondent(msg=bytearray())
+    if started:
+        # Suspend the parser while it awaits the first response byte.
+        respondent.parse()
+        assert respondent.parser is not None
+
+    # The peer closes without sending even an HTTP status line.
+    respondent.close()
+    _service_respondent(respondent)
+
+    assert respondent.closed
+    assert respondent.ended
+    assert respondent.errored
+    assert "before HTTP message" in respondent.error
+
+
 def test_respondent_chunked_eof_consumes_terminal_zero_chunk():
     """Buffered response chunks remain incomplete until zero framing is read."""
     respondent = _respondent_waiting_for_chunk_body()
