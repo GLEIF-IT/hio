@@ -2,6 +2,7 @@
 """
 Tests for http serving module
 """
+import logging
 import sys
 import os
 import socket
@@ -446,7 +447,35 @@ def _make_tracked_responder(values, headers=None, close_error=None,
     return responder, remoter, iterable, iterator
 
 
-def test_responder_application_call_exception_is_failure():
+@pytest.fixture
+def producer_log_records():
+    """Capture real Responder log records without replacing its logger."""
+    records = []
+
+    class RecordHandler(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = RecordHandler()
+    level = serving.logger.level
+    serving.logger.addHandler(handler)
+    serving.logger.setLevel(logging.ERROR)
+    try:
+        yield records
+    finally:
+        serving.logger.removeHandler(handler)
+        serving.logger.setLevel(level)
+
+
+def _assert_logged_exception(records, error):
+    """Assert diagnostics retain the original exception and traceback."""
+    assert len(records) == 1
+    assert records[0].exc_info is not None
+    assert records[0].exc_info[1] is error
+    assert records[0].exc_info[2] is not None
+
+
+def test_responder_application_call_exception_is_failure(producer_log_records):
     """Failure before the application returns still settles the response."""
     # Arrange: make application invocation fail before an iterable exists.
     error = RuntimeError("application call failed")
@@ -467,9 +496,11 @@ def test_responder_application_call_exception_is_failure():
     assert not remoter.txbs
     assert responder.iterable is None
     assert responder.iterator is None
+    # The contained application failure must remain diagnosable.
+    _assert_logged_exception(producer_log_records, error)
 
 
-def test_responder_iter_exception_closes_returned_iterable():
+def test_responder_iter_exception_closes_returned_iterable(producer_log_records):
     """Failure constructing the iterator releases the application result."""
     # Arrange: return a closeable iterable whose __iter__ fails.
     error = RuntimeError("iterator construction failed")
@@ -493,9 +524,11 @@ def test_responder_iter_exception_closes_returned_iterable():
     assert iterable.close_count == 1
     assert responder.iterable is None
     assert responder.iterator is None
+    # Iterator-construction diagnostics must identify the triggering failure.
+    _assert_logged_exception(producer_log_records, error)
 
 
-def test_responder_next_exception_closes_returned_iterable():
+def test_responder_next_exception_closes_returned_iterable(producer_log_records):
     """Failure advancing the iterator terminates response production."""
     # Arrange: make the first iterator advancement fail.
     error = RuntimeError("iterator advancement failed")
@@ -515,6 +548,8 @@ def test_responder_next_exception_closes_returned_iterable():
     assert iterator.close_count == 0
     assert responder.iterable is None
     assert responder.iterator is None
+    # Iterator-advancement diagnostics must retain the failing traceback.
+    _assert_logged_exception(producer_log_records, error)
 
 
 def test_responder_application_http_error_before_headers_is_response():
