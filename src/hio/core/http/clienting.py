@@ -1155,14 +1155,23 @@ class Client():
             if self.respondent:
                 self.respondent.close()  # close any pending or current response parsing
 
-            if self.connector.reconnectable:  # useful for server sent event stream
-                if self.connector.tymeout > 0.0 and self.connector.tymer.expired:  # timed out
-                    self.reopen()
-                    if self.respondent.evented:
-                        duration = float(self.respondent.retry) / 1000.0 # convert to seconds
-                    else:
-                        duration = None  # reused current duration
-                    self.connector.tymer.restart(duration=duration)
+            reconnect = (self.connector.reconnectable and
+                         self.connector.tymeout > 0.0 and
+                         self.connector.tymer.expired)  # useful for server sent event stream
+
+            self.serviceResponse()  # settle old-generation EOF before reset
+
+            settled = (not self.waited or self.respondent is None or
+                       self.respondent.ended)
+            if reconnect and settled:
+                if self.respondent and self.respondent.evented:
+                    duration = float(self.respondent.retry) / 1000.0 # convert to seconds
+                else:
+                    duration = None  # reused current duration
+                self.connector.clearRxbs()
+                self.reopen()
+                self.connector.tymer.restart(duration=duration)
+            return  # connect/admit/send only on a later recurrence
 
         if not self.connector.connected:
             self.connector.serviceConnect()
