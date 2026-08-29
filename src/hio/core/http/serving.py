@@ -529,14 +529,15 @@ class Responder():
                     self.iterator = iter(self.iterable)
                 msg = next(self.iterator)
             except StopIteration as ex:
-                if hasattr(ex, "value") and ex.value:
-                    self.write(ex.value)  # new style generators in python3.3+
-                try:  # PEP 3333 cleanup contract for the returned iterable
+                try:
+                    if hasattr(ex, "value") and ex.value:
+                        self.write(ex.value)  # generator return value
+                    # PEP 3333 cleanup precedes successful terminal framing.
                     self._closeIterable()
+                    self.write(b'')  # terminal chunk follows producer cleanup
                 except Exception as error:
                     self.abort(error)
                 else:
-                    self.write(b'')  # terminal chunk follows producer cleanup
                     self.ended = True
             except httping.HTTPError as ex:
                 if not self.headed:
@@ -551,10 +552,10 @@ class Responder():
                         status = "{} {}".format(ex.status, ex.reason)
                         self._closeIterable()
                         self.start(status, headers.items(), sys.exc_info())
+                        self.write(msg)
                     except Exception as error:
                         self.abort(error)
                     else:
-                        self.write(msg)
                         self.ended = True
                 else:
                     logger.error("HTTPError streaming body after headers sent.\n"
@@ -565,7 +566,11 @@ class Responder():
                 self.abort(ex)
             else:
                 if msg:  # only write if not empty allows async processing
-                    self.write(msg)
+                    try:
+                        self.write(msg)
+                    except Exception as error:
+                        self.abort(error)
+                        return
                 if self.length is not None and self.size >= self.length:
                     try:  # PEP 3333 cleanup contract for the returned iterable
                         self._closeIterable()

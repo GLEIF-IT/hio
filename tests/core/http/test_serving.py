@@ -4,6 +4,7 @@ Tests for http serving module
 """
 import sys
 import os
+import socket
 import time
 
 import pytest
@@ -501,6 +502,112 @@ def test_responder_http_error_after_headers_is_failure():
     assert responder.closed
     assert responder.errored
     assert responder.error is error
+    assert not responder.ended
+    assert bytes(remoter.txbs) == before
+    assert not remoter.txbs.endswith(b"0\r\n\r\n")
+    assert iterable.close_count == 1
+    assert iterator.close_count == 0
+    assert responder.iterable is None
+    assert responder.iterator is None
+
+
+def test_responder_body_enqueue_failure_is_failure():
+    """A failed body enqueue aborts an already committed response."""
+    # Arrange: commit part of a fixed body, then close the transport send side.
+    responder, remoter, iterable, iterator = _make_tracked_responder(
+        [b"fi", b"nal"], headers=[("Content-Length", "5")])
+    responder.service()
+    before = bytes(remoter.txbs)
+    remoter.shutdown(how=socket.SHUT_WR)
+
+    # Act: attempt to enqueue the next ordinary body chunk.
+    responder.service()
+
+    # Assert: failure wins even though write() reached the declared byte count.
+    assert responder.closed
+    assert responder.errored
+    assert responder.error is remoter.error
+    assert not responder.ended
+    assert bytes(remoter.txbs) == before
+    assert iterable.close_count == 1
+    assert iterator.close_count == 0
+    assert responder.iterable is None
+    assert responder.iterator is None
+
+
+def test_responder_generator_return_enqueue_failure_is_failure():
+    """A failed generator-return enqueue cannot become normal completion."""
+    events = []
+
+    # Arrange: return a final body value after one successfully queued chunk.
+    def producer():
+        try:
+            yield b"body"
+            return b"tail"
+        finally:
+            events.append("closed")
+
+    def app(environ, start_response):
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return producer()
+
+    responder, remoter = _make_app_responder(app)
+    responder.service()
+    before = bytes(remoter.txbs)
+    remoter.shutdown(how=socket.SHUT_WR)
+
+    # Act: exhaust the generator and attempt to enqueue its return value.
+    responder.service()
+
+    # Assert: the return value is not mistaken for transmitted completion.
+    assert responder.closed
+    assert responder.errored
+    assert responder.error is remoter.error
+    assert not responder.ended
+    assert bytes(remoter.txbs) == before
+    assert events == ["closed"]
+    assert responder.iterable is None
+    assert responder.iterator is None
+
+
+def test_responder_rendered_http_error_enqueue_failure_is_failure():
+    """A rendered HTTPError is not complete unless its bytes are queued."""
+    # Arrange: raise a renderable error after closing the transport send side.
+    error = httping.HTTPError(status=503, detail="try later")
+    responder, remoter, iterable, iterator = _make_tracked_responder(
+        [], terminal_error=error)
+    remoter.shutdown(how=socket.SHUT_WR)
+
+    # Act: render the HTTP error and attempt to enqueue its response.
+    responder.service()
+
+    # Assert: enqueue failure replaces the prospective successful response.
+    assert responder.closed
+    assert responder.errored
+    assert responder.error is remoter.error
+    assert not responder.ended
+    assert not remoter.txbs
+    assert iterable.close_count == 1
+    assert iterator.close_count == 0
+    assert responder.iterable is None
+    assert responder.iterator is None
+
+
+def test_responder_terminal_chunk_enqueue_failure_is_failure():
+    """A failed terminal chunk enqueue cannot be reported as completion."""
+    # Arrange: queue a finite body, then close the send side before exhaustion.
+    responder, remoter, iterable, iterator = _make_tracked_responder([b"body"])
+    responder.service()
+    before = bytes(remoter.txbs)
+    remoter.shutdown(how=socket.SHUT_WR)
+
+    # Act: observe exhaustion and attempt to enqueue terminal chunk framing.
+    responder.service()
+
+    # Assert: cleanup occurs, but the response remains a terminal failure.
+    assert responder.closed
+    assert responder.errored
+    assert responder.error is remoter.error
     assert not responder.ended
     assert bytes(remoter.txbs) == before
     assert not remoter.txbs.endswith(b"0\r\n\r\n")
