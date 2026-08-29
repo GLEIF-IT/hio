@@ -190,18 +190,37 @@ def test_requestant_consumes_complete_buffered_framing_before_eof(
     assert not requestant.msg
 
 
+@pytest.mark.parametrize(
+    "initial, partial",
+    [
+        (b"", b"GET /partial HTTP/1.1"),
+        (b"GET /partial HTTP/1.1\r\n", b"Host: localhost\r\n"),
+        (b"POST /partial HTTP/1.1\r\nHost: localhost\r\n"
+         b"Content-Length: 4\r\n\r\n", b"te"),
+    ],
+)
+def test_requestant_rejects_partial_buffered_framing_at_eof(initial, partial):
+    """Partial request-line, headers, or fixed body at EOF are failures."""
+    remoter = tcp.Remoter(ha=("127.0.0.1", 6101),
+                          ca=("127.0.0.1", 6102),
+                          cs=None)
+    requestant = serving.Requestant(msg=bytearray(initial), remoter=remoter)
+    requestant.parse()
+    assert requestant.parser is not None
+
+    # EOF makes the buffered fragment terminal instead of merely incomplete.
+    requestant.msg.extend(partial)
+    requestant.close()
+    _service_requestant(requestant)
+
+    assert requestant.closed
+    assert requestant.ended
+    assert requestant.errored
+    assert "closed unexpectedly" in requestant.error.lower()
+
+
 def test_responder_content_length_closes_producer():
     """Content-Length completion closes rather than resumes the producer."""
-    # Responder writes outbound HTTP bytes to an accepted TCP/TLS connection
-    # through tx(). This stand-in captures that transport queue without adding
-    # socket scheduling to a producer-lifecycle test.
-    class Incomer:
-        def __init__(self):
-            self.txbs = bytearray()
-
-        def tx(self, msg):
-            self.txbs.extend(msg)
-
     events = []
 
     # HIO's Server is configured with a WSGI application like this generator.
@@ -216,8 +235,10 @@ def test_responder_content_length_closes_producer():
             # Closing the WSGI producer must still release its resources.
             events.append("closed")
 
-    incomer = Incomer()
-    responder = serving.Responder(incomer=incomer,
+    remoter = tcp.Remoter(ha=("127.0.0.1", 6101),
+                          ca=("127.0.0.1", 6102),
+                          cs=None)
+    responder = serving.Responder(incomer=remoter,
                                   app=app,
                                   environ={},
                                   chunkable=True)
@@ -228,8 +249,8 @@ def test_responder_content_length_closes_producer():
     assert responder.ended
     assert responder.iterator is None
     assert events == ["closed"]
-    assert incomer.txbs.endswith(b"body")
-    assert incomer.txbs.count(b"body") == 1
+    assert remoter.txbs.endswith(b"body")
+    assert remoter.txbs.count(b"body") == 1
 
 
 def _make_chunked_responder(values=(b"body", b"later")):
@@ -664,29 +685,14 @@ def test_responder_normal_completion_remains_successful():
 def test_wsgi_server_reuse_resets_request_scoped_response_state():
     """A reused responder derives transfer state from the next request."""
     ca = ("127.0.0.1", 6101)
-    # Use the production connection type without opening a socket; no I/O occurs.
     remoter = tcp.Remoter(ha=("127.0.0.1", 6100), ca=ca, cs=None)
 
-    # Model the next parsed HTTP/1.1 request on the same connection.
-    class Requestant:
-        parser = True
-        ended = False
-        errored = False
-        error = None
-        headed = True
-        method = "GET"
-        path = "/next"
-        version = (1, 1)
-        headers = help.Hict()
-        body = bytearray()
-
-        def parse(self):
-            self.parser = None
-            self.ended = True
+    def app(environ, start_response):
+        return []
 
     # Seed response-scoped state left by the prior HTTP/1.1 SSE response.
     responder = serving.Responder(incomer=remoter,
-                                  app=None,
+                                  app=app,
                                   environ={"request": "old"},
                                   chunkable=True)
     responder.start("200 OK", [("Content-Type", "text/event-stream")])
@@ -694,23 +700,29 @@ def test_wsgi_server_reuse_resets_request_scoped_response_state():
     assert responder.evented
     assert responder.chunkable
 
-    requestant = Requestant()
-    requestant.remoter = remoter
-    # Isolate the Server handoff that reuses the existing Responder.
-    server = serving.Server(app=None, port=6101)
+    # Feed the real request parser the next persistent HTTP/1.1 request.
+    requestant = serving.Requestant(
+        msg=bytearray(b"GET /next HTTP/1.1\r\n"
+                      b"Host: localhost\r\n\r\n"),
+        remoter=remoter)
+    server = serving.Server(app=app, port=6101)
     server.reqs[ca] = requestant
     server.reps[ca] = responder
-    server.buildEnviron = lambda request: {"request": "next"}
 
-    server.serviceReqs()  # calls responder.reset, passing in "chunkable" during reset
+    # Parsing, environment construction, and responder reuse all run normally.
+    server.serviceReqs()
 
-    assert responder.environ == {"request": "next"}
-    assert responder.chunkable  # should have received this from the .reset call
+    assert requestant.ended
+    assert requestant.headed
+    assert responder.environ["REQUEST_METHOD"] == "GET"
+    assert responder.environ["PATH_INFO"] == "/next"
+    assert responder.environ["SERVER_PROTOCOL"] == "HTTP/1.1"
+    assert responder.chunkable
     assert not responder.evented
 
     responder.start("200 OK", [("Content-Type", "text/plain")])
     head = responder.build()
-    assert b"Transfer-Encoding: chunked\r\n" in head  # verifies passed in "chunked" is used
+    assert b"Transfer-Encoding: chunked\r\n" in head
 
 
 def test_bare_server_echo():
