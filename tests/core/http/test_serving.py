@@ -50,6 +50,70 @@ def _service_requestant(requestant, limit=8):
     raise AssertionError("request parser did not settle")
 
 
+@pytest.mark.parametrize("started", [False, True])
+def test_requestant_empty_eof_settles_without_request(started):
+    """Empty EOF remains terminal without inventing an HTTP request."""
+    remoter = tcp.Remoter(ha=("127.0.0.1", 6101),
+                          ca=("127.0.0.1", 6102),
+                          cs=None)
+    requestant = serving.Requestant(msg=bytearray(), remoter=remoter)
+    if started:
+        # Suspend the parser while it awaits the first request byte.
+        requestant.parse()
+        assert requestant.parser is not None
+
+    # An inbound peer may close cleanly without submitting a request.
+    requestant.close()
+    _service_requestant(requestant)
+
+    assert requestant.closed
+    assert requestant.ended
+    assert not requestant.errored
+    assert not requestant.headed
+    assert not requestant.bodied
+
+
+def test_wsgi_server_does_not_admit_empty_eof():
+    """A settled headless request parser never creates a WSGI responder."""
+    # Any entry proves that the server admitted a nonexistent HTTP request.
+    calls = []
+
+    def app(environ, start_response):
+        calls.append(environ)
+        return []
+
+    with tcp.openServer(ha=("127.0.0.1", 0)) as servant:
+        servant.eha = servant.ha
+        with tcp.openClient(ha=servant.ha) as client:
+            for _ in range(100):
+                client.serviceConnect()
+                servant.serviceConnects()
+                if client.connected and client.ca in servant.ixes:
+                    break
+                time.sleep(0.01)
+            assert client.connected
+            assert client.ca in servant.ixes
+
+            server = serving.Server(app=app,
+                                    servant=servant,
+                                    ha=servant.ha)
+            remoter = servant.ixes[client.ca]
+            requestant = serving.Requestant(msg=remoter.rxbs,
+                                             remoter=remoter)
+            # Model transport EOF before the client sends an HTTP start line.
+            requestant.close()
+            server.reqs[client.ca] = requestant
+
+            server.serviceReqs()
+
+            assert requestant.parser is None
+            assert requestant.ended
+            assert not requestant.errored
+            assert not requestant.headed
+            assert not calls
+            assert not server.reps
+
+
 def test_requestant_chunked_eof_consumes_terminal_zero_chunk():
     """Buffered request chunks remain incomplete until zero framing is read."""
     requestant = _requestant_waiting_for_chunk_body()
@@ -180,6 +244,7 @@ def test_wsgi_server_reuse_resets_request_scoped_response_state():
         ended = False
         errored = False
         error = None
+        headed = True
         method = "GET"
         path = "/next"
         version = (1, 1)
