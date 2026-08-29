@@ -289,7 +289,8 @@ class Responder():
         self.closed = False  # True if connection closed by far side
         self.errored = False  # True if response production failed
         self.error = None  # retained response production failure
-        self.iterator = None  # iterator on application body
+        self.iterable = None  # application-returned WSGI iterable retained for .close
+        self.iterator = None  # iterator on application body retained for next() calls
         self.status = status
         self.headers = help.Hict()  # headers
         self.length = None  # if content-length provided must not exceed
@@ -321,15 +322,31 @@ class Responder():
             self.errored = True
             self.error = error
 
+        try:
+            self._closeIterable()
+        except Exception as ex:
+            logger.error("Error closing WSGI response iterable.\n%s\n", ex)
+            if self.error is None:
+                self.error = ex
+
         self.closed = True
 
 
-    def closeIterator(self):
-        """Close and forget the WSGI application response iterator."""
-        iterator = self.iterator
+    def _closeIterable(self):
+        """
+        Close the application-returned WSGI iterable exactly once and
+        forget the iterator used.
+
+        This releases request-scoped resources through middleware or wrapper
+        cleanup contracts as required by PEP 3333.
+        """
+        iterable = self.iterable
+        self.iterable = None
         self.iterator = None
-        if iterator is not None and hasattr(iterator, "close"):
-            iterator.close()
+        # PEP 3333 requires closing the application result when it provides
+        # a close() method.
+        if iterable is not None and hasattr(iterable, "close"):
+            iterable.close()
 
 
     def reset(self, environ, chunkable=None):
@@ -340,6 +357,7 @@ class Responder():
             raise RuntimeError(
                 "Cannot reuse a responder without normal completion")
 
+        self._closeIterable()
         self.environ = environ
 
         if chunkable is not None:
@@ -352,6 +370,7 @@ class Responder():
         self.closed = False
         self.errored = False
         self.error = None
+        self.iterable = None
         self.iterator = None
         self.status = "200 OK"
         self.headers = help.Hict()
@@ -503,15 +522,23 @@ class Responder():
         """
         if not self.closed and not self.ended:
             if self.iterator is None:  # initiate application
-                self.iterator = iter(self.app(self.environ,
-                                              start_response=self.start))
+                # Retain access to the WSGI iterable for a .close to guarantee
+                # PEP 3333 resource cleanup
+                self.iterable = self.app(self.environ,
+                                         start_response=self.start)
+                self.iterator = iter(self.iterable)
             try:
                 msg = next(self.iterator)
             except StopIteration as ex:
                 if hasattr(ex, "value") and ex.value:
                     self.write(ex.value)  # new style generators in python3.3+
-                self.write(b'')  # in case chunked send empty chunk to terminate
-                self.ended = True
+                try:  # PEP 3333 cleanup contract for the returned iterable
+                    self._closeIterable()
+                except Exception as error:
+                    self.abort(error)
+                else:
+                    self.write(b'')  # terminal chunk follows producer cleanup
+                    self.ended = True
             except httping.HTTPError as ex:
                 if not self.headed:
                     headers = help.Hict()
@@ -534,8 +561,12 @@ class Responder():
                 if msg:  # only write if not empty allows async processing
                     self.write(msg)
                 if self.length is not None and self.size >= self.length:
-                    self.ended = True
-                    self.closeIterator()
+                    try:  # PEP 3333 cleanup contract for the returned iterable
+                        self._closeIterable()
+                    except Exception as error:
+                        self.abort(error)
+                    else:
+                        self.ended = True
 
 
 @contextmanager

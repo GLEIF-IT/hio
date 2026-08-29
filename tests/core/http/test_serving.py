@@ -249,6 +249,157 @@ def _make_chunked_responder(values=(b"body", b"later")):
     return responder, remoter
 
 
+class _CloseTrackingIterator:
+    """
+    Iterator distinct from its application-returned iterable.
+    Models the iterator Responder obtains from iter(iterable).
+    """
+
+    def __init__(self, values):
+        self.values = iter(values)
+        self.next_count = 0
+        self.close_count = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.next_count += 1
+        return next(self.values)
+
+    def close(self):
+        self.close_count += 1
+
+
+class _CloseTrackingIterable:
+    """
+    Application result with observable cleanup ownership.
+    Models a closeable iterable returned by a WSGI application.
+    """
+
+    def __init__(self, iterator, close_error=None):
+        self._iterator = iterator
+        self.close_error = close_error
+        self.close_count = 0
+
+    def __iter__(self):
+        return self._iterator
+
+    def close(self):
+        self.close_count += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
+def _make_tracked_responder(values, headers=None, close_error=None):
+    """Build a Responder whose returned iterable differs from its iterator."""
+    iterator = _CloseTrackingIterator(values)
+    iterable = _CloseTrackingIterable(iterator, close_error=close_error)
+    remoter = tcp.Remoter(ha=("127.0.0.1", 6103),
+                          ca=("127.0.0.1", 6104),
+                          cs=None)
+
+    # The WSGI application returns the iterable that owns cleanup.
+    def app(environ, start_response):
+        start_response("200 OK", headers or [("Content-Type", "text/plain")])
+        return iterable
+
+    responder = serving.Responder(incomer=remoter,
+                                  app=app,
+                                  environ={},
+                                  chunkable=True)
+    return responder, remoter, iterable, iterator
+
+
+def test_responder_closes_returned_iterable_after_normal_exhaustion():
+    """Normal WSGI exhaustion closes the application result exactly once."""
+    # Arrange: return an iterable whose iterator is a different closeable object.
+    responder, remoter, iterable, iterator = _make_tracked_responder([b"body"])
+
+    # Act: emit the body, observe exhaustion, and reset for persistent reuse.
+    responder.service()
+    responder.service()
+    responder.reset(environ={"request": "next"}, chunkable=True)
+
+    # Assert: cleanup belongs to the returned iterable and is not repeated.
+    assert iterable.close_count == 1
+    assert iterator.close_count == 0
+    assert responder.iterable is None
+    assert responder.iterator is None
+    assert remoter.txbs.count(b"0\r\n\r\n") == 1
+
+
+def test_responder_content_length_closes_returned_iterable():
+    """Early Content-Length completion closes the application result."""
+    # Arrange: leave another value behind the exact declared response length.
+    responder, _, iterable, iterator = _make_tracked_responder(
+        [b"body", b"later"], headers=[("Content-Length", "4")])
+
+    # Act: one service call reaches the exact HTTP body boundary.
+    responder.service()
+
+    # Assert: HIO stops iteration and closes the returned owner, not its iterator.
+    assert responder.ended
+    assert iterator.next_count == 1
+    assert iterable.close_count == 1
+    assert iterator.close_count == 0
+    assert responder.iterable is None
+    assert responder.iterator is None
+
+
+@pytest.mark.parametrize("operation", ["close", "abort"])
+def test_responder_failure_closes_returned_iterable_once(operation):
+    """Every incomplete terminal path releases the WSGI application result."""
+    # Arrange: partially emit a response while the producer still has work.
+    responder, remoter, iterable, iterator = _make_tracked_responder(
+        [b"body", b"later"])
+    responder.service()
+    before = bytes(remoter.txbs)
+
+    # Act: terminate through connection closure or an explicit producer abort.
+    if operation == "close":
+        responder.close()
+        responder.close()
+    else:
+        responder.abort(BrokenPipeError("response transport closed"))
+        responder.close()
+
+    # Assert: failure adds no framing and closes only the application result.
+    assert responder.closed
+    assert responder.errored
+    assert not responder.ended
+    assert bytes(remoter.txbs) == before
+    assert iterable.close_count == 1
+    assert iterator.close_count == 0
+    assert responder.iterable is None
+    assert responder.iterator is None
+
+
+def test_responder_iterable_cleanup_failure_prevents_completion():
+    """Cleanup failure wins before successful terminal framing is claimed."""
+    # Arrange: make returned-iterable cleanup fail after its body is exhausted.
+    error = RuntimeError("iterable cleanup failed")
+    responder, remoter, iterable, iterator = _make_tracked_responder(
+        [b"body"], close_error=error)
+    responder.service()
+    before = bytes(remoter.txbs)
+
+    # Act: observe exhaustion and the resulting cleanup failure.
+    responder.service()
+
+    # Assert: the cleanup cause is retained and no terminal chunk is appended.
+    assert responder.closed
+    assert responder.errored
+    assert responder.error is error
+    assert not responder.ended
+    assert bytes(remoter.txbs) == before
+    assert not remoter.txbs.endswith(b"0\r\n\r\n")
+    assert iterable.close_count == 1
+    assert iterator.close_count == 0
+    assert responder.iterable is None
+    assert responder.iterator is None
+
+
 @pytest.mark.parametrize("after_output", [False, True])
 def test_responder_incomplete_close_is_failure(after_output):
     """Administrative close cannot impersonate normal WSGI exhaustion."""
