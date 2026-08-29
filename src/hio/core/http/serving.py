@@ -562,7 +562,7 @@ class Responder():
                                     "%s\n", ex)
                     self.abort(ex)
             except Exception as ex:  # handle http exceptions not caught by app
-                logger.error("Unexpected Server Error.\n%s\n", ex)
+                logger.exception("Unexpected Server Error.")
                 self.abort(ex)
             else:
                 if msg:  # only write if not empty allows async processing
