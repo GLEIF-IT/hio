@@ -40,6 +40,135 @@ def _service_client_connection(client, server):
     raise AssertionError("client did not connect")
 
 
+def _deliver_response_and_cutoff(client, server, payload):
+    """Complete a real request, deliver a response, and close its server ix."""
+    # Start an exchange on the current transport generation.
+    client.transmit(method="GET", path="/old-generation")
+    ca = client.connector.ca
+    remoter = server.ixes[ca]
+
+    # Deliver the complete request to the real server-side connection.
+    for _ in range(100):
+        client.connector.serviceSends()
+        server.serviceReceivesAllIx()
+        if not client.connector.txbs and remoter.rxbs:
+            break
+        time.sleep(0.01)
+    assert not client.connector.txbs
+    assert remoter.rxbs
+    remoter.clearRxbs()
+
+    # Buffer the response at the client before the peer closes its socket.
+    remoter.tx(payload)
+    for _ in range(100):
+        remoter.serviceSends()
+        client.connector.serviceReceives()
+        if payload in client.connector.rxbs:
+            break
+        time.sleep(0.01)
+    assert payload in client.connector.rxbs
+
+    # Retiring the server ix produces peer EOF and client-side cutoff.
+    server.removeIx(ca)
+    for _ in range(100):
+        client.connector.serviceReceives()
+        if client.connector.cutoff:
+            break
+        time.sleep(0.01)
+    assert client.connector.cutoff
+    return client.connector.cs
+
+
+@pytest.mark.parametrize(
+    "payload, expected_body, expected_error",
+    [
+        (b"HTTP/1.0 200 OK\r\nConnection: close\r\n\r\nold-body",
+         b"old-body",
+         False),
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab",
+         b"",
+         True),
+    ],
+)
+def test_client_cutoff_settles_old_response_before_reconnect(
+        payload, expected_body, expected_error):
+    """Reconnect cannot erase a complete or failed old response generation."""
+    tymist = tyming.Tymist(tyme=0.0)
+    with tcp.openServer(tymth=tymist.tymen(),
+                        ha=("127.0.0.1", 0)) as server:
+        server.eha = server.ha
+        with clienting.openClient(hostname=server.ha[0],
+                                  port=server.ha[1],
+                                  tymth=tymist.tymen(),
+                                  reconnectable=True,
+                                  tymeout=1.0) as client:
+            _service_client_connection(client, server)
+            old_socket = _deliver_response_and_cutoff(client, server, payload)
+            tymist.tick(tock=1.1)
+            assert client.connector.tymer.expired
+
+            # Settle the buffered response, then open the replacement generation.
+            client.service()
+
+            # Reconnectability replaces a dead socket; it does not reuse it.
+            assert old_socket.fileno() == -1
+            assert not client.waited
+            assert len(client.responses) == 1
+            response = client.responses.popleft()
+            assert response["body"] == expected_body
+            assert response["errored"] is expected_error
+            if expected_error:
+                assert "closed unexpectedly" in response["error"].lower()
+            else:
+                assert response["error"] is None
+            assert not client.connector.rxbs
+            assert client.connector.opened
+            assert not client.connector.connected
+            assert not client.respondent.closed
+            assert not client.respondent.headed
+            assert not client.respondent.ended
+
+
+def test_client_cutoff_preserves_sse_retry_before_reconnect():
+    """SSE cutoff parses accepted events and applies their retry interval."""
+    payload = (b"HTTP/1.1 200 OK\r\n"
+               b"Content-Type: text/event-stream\r\n\r\n"
+               b"retry: 2500\n"
+               b"id: event-1\n"
+               b"data: old-event\n\n")
+    tymist = tyming.Tymist(tyme=0.0)
+    with tcp.openServer(tymth=tymist.tymen(),
+                        ha=("127.0.0.1", 0)) as server:
+        server.eha = server.ha
+        with clienting.openClient(hostname=server.ha[0],
+                                  port=server.ha[1],
+                                  tymth=tymist.tymen(),
+                                  reconnectable=True,
+                                  tymeout=1.0) as client:
+            _service_client_connection(client, server)
+            old_socket = _deliver_response_and_cutoff(client, server, payload)
+            tymist.tick(tock=1.1)
+
+            # Parse old-generation SSE bytes before resetting the transport.
+            client.service()
+
+            # The physical socket is replaced while logical SSE state survives.
+            assert old_socket.fileno() == -1
+            assert client.waited
+            assert client.respondent.evented
+            assert client.respondent.retry == 2500
+            assert client.connector.tymer.duration == 2.5
+            assert len(client.events) == 1
+            assert client.events[0]["id"] == "event-1"
+            assert client.events[0]["data"] == "old-event"
+            assert not client.connector.rxbs
+            assert client.connector.opened
+            assert not client.connector.connected
+            assert not client.respondent.closed
+            assert not client.respondent.headed
+            assert not client.respondent.ended
+
+
 def test_respondent_reopen_resets_parser_generation():
     """A new transport generation explicitly resets terminal parser state."""
     respondent = clienting.Respondent(msg=bytearray())
