@@ -80,6 +80,42 @@ def _deliver_response_and_cutoff(client, server, payload):
 
 
 @pytest.mark.parametrize(
+    "connector_cls, scheme, port",
+    [
+        (tcp.Client, "http", 56000),
+        (tcp.ClientTls, "https", 56001),
+    ],
+)
+def test_client_exposes_connector_lifecycle(connector_cls, scheme, port):
+    """HTTP Client exposes its raw or TLS connector's directional facts."""
+    connector = connector_cls(host="127.0.0.1", port=port)
+    client = clienting.Client(connector=connector, scheme=scheme)
+
+    assert not client.cutoff
+    assert not client.txCutoff
+    assert client.error is None
+
+    connector.cutoff = True
+    assert client.cutoff
+    assert not client.txCutoff
+
+    connector.cutoff = False
+    connector.txCutoff = True
+    error = BrokenPipeError("send direction closed")
+    connector.error = error
+    assert not client.cutoff
+    assert client.txCutoff
+    assert client.error is error
+
+    assert client.reopen()
+    assert not client.cutoff
+    assert not client.txCutoff
+    assert client.error is None
+
+    client.close()
+
+
+@pytest.mark.parametrize(
     "payload, expected_body, expected_error",
     [
         (b"HTTP/1.0 200 OK\r\nConnection: close\r\n\r\nold-body",

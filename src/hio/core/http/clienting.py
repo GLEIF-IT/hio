@@ -850,6 +850,24 @@ class Client():
         self.respondent = respondent
 
 
+    @property
+    def cutoff(self):
+        """Return the connector's receive-terminal state."""
+        return self.connector.cutoff
+
+
+    @property
+    def txCutoff(self):
+        """Return the connector's transmit-terminal state."""
+        return self.connector.txCutoff
+
+
+    @property
+    def error(self):
+        """Return the connector's retained terminal transport error."""
+        return self.connector.error
+
+
     def wind(self, tymth):
         """
         Inject new tymist.tymth as new ._tymth. Changes tymist.tyme base.
