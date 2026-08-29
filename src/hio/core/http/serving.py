@@ -521,13 +521,12 @@ class Responder():
         Service wsgi compatible application
         """
         if not self.closed and not self.ended:
-            if self.iterator is None:  # initiate application
-                # Retain access to the WSGI iterable for a .close to guarantee
-                # PEP 3333 resource cleanup
-                self.iterable = self.app(self.environ,
-                                         start_response=self.start)
-                self.iterator = iter(self.iterable)
             try:
+                if self.iterator is None:  # initiate application
+                    # Retain the application result for PEP 3333 cleanup.
+                    self.iterable = self.app(self.environ,
+                                             start_response=self.start)
+                    self.iterator = iter(self.iterable)
                 msg = next(self.iterator)
             except StopIteration as ex:
                 if hasattr(ex, "value") and ex.value:
@@ -541,22 +540,29 @@ class Responder():
                     self.ended = True
             except httping.HTTPError as ex:
                 if not self.headed:
-                    headers = help.Hict()
-                    headers.update(ex.headers.items())
-                    if 'content-type' not in headers:
-                        headers['content-type'] = 'text/plain'
-                    msg = ex.render()
-                    headers['content-length'] = str(len(msg))
-                    # WSGI status is string of status code and reason
-                    status = "{} {}".format(ex.status, ex.reason)
-                    self.start(status, headers.items(), sys.exc_info())
-                    self.write(msg)
-                    self.ended = True
+                    try:
+                        headers = help.Hict()
+                        headers.update(ex.headers.items())
+                        if 'content-type' not in headers:
+                            headers['content-type'] = 'text/plain'
+                        msg = ex.render()
+                        headers['content-length'] = str(len(msg))
+                        # WSGI status is string of status code and reason
+                        status = "{} {}".format(ex.status, ex.reason)
+                        self._closeIterable()
+                        self.start(status, headers.items(), sys.exc_info())
+                    except Exception as error:
+                        self.abort(error)
+                    else:
+                        self.write(msg)
+                        self.ended = True
                 else:
                     logger.error("HTTPError streaming body after headers sent.\n"
                                     "%s\n", ex)
+                    self.abort(ex)
             except Exception as ex:  # handle http exceptions not caught by app
-                logger.error("Unexcepted Server Error.\n%s\n", ex)
+                logger.error("Unexpected Server Error.\n%s\n", ex)
+                self.abort(ex)
             else:
                 if msg:  # only write if not empty allows async processing
                     self.write(msg)

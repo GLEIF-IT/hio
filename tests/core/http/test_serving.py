@@ -255,8 +255,9 @@ class _CloseTrackingIterator:
     Models the iterator Responder obtains from iter(iterable).
     """
 
-    def __init__(self, values):
+    def __init__(self, values, terminal_error=None):
         self.values = iter(values)
+        self.terminal_error = terminal_error
         self.next_count = 0
         self.close_count = 0
 
@@ -265,7 +266,14 @@ class _CloseTrackingIterator:
 
     def __next__(self):
         self.next_count += 1
-        return next(self.values)
+        try:
+            return next(self.values)
+        except StopIteration:
+            if self.terminal_error is None:
+                raise
+            error = self.terminal_error
+            self.terminal_error = None
+            raise error
 
     def close(self):
         self.close_count += 1
@@ -291,9 +299,36 @@ class _CloseTrackingIterable:
             raise self.close_error
 
 
-def _make_tracked_responder(values, headers=None, close_error=None):
+class _IterFailingIterable:
+    """Application result whose iterator construction fails."""
+
+    def __init__(self, error):
+        self.error = error
+        self.close_count = 0
+
+    def __iter__(self):
+        raise self.error
+
+    def close(self):
+        self.close_count += 1
+
+
+def _make_app_responder(app):
+    """Build a production Responder over a real Remoter transmit queue."""
+    remoter = tcp.Remoter(ha=("127.0.0.1", 6105),
+                          ca=("127.0.0.1", 6106),
+                          cs=None)
+    responder = serving.Responder(incomer=remoter,
+                                  app=app,
+                                  environ={},
+                                  chunkable=True)
+    return responder, remoter
+
+
+def _make_tracked_responder(values, headers=None, close_error=None,
+                            terminal_error=None):
     """Build a Responder whose returned iterable differs from its iterator."""
-    iterator = _CloseTrackingIterator(values)
+    iterator = _CloseTrackingIterator(values, terminal_error=terminal_error)
     iterable = _CloseTrackingIterable(iterator, close_error=close_error)
     remoter = tcp.Remoter(ha=("127.0.0.1", 6103),
                           ca=("127.0.0.1", 6104),
@@ -309,6 +344,149 @@ def _make_tracked_responder(values, headers=None, close_error=None):
                                   environ={},
                                   chunkable=True)
     return responder, remoter, iterable, iterator
+
+
+def test_responder_application_call_exception_is_failure():
+    """Failure before the application returns still settles the response."""
+    # Arrange: make application invocation fail before an iterable exists.
+    error = RuntimeError("application call failed")
+
+    def app(environ, start_response):
+        raise error
+
+    responder, remoter = _make_app_responder(app)
+
+    # Act: begin response production.
+    responder.service()
+
+    # Assert: the original failure is terminal and no response bytes are queued.
+    assert responder.closed
+    assert responder.errored
+    assert responder.error is error
+    assert not responder.ended
+    assert not remoter.txbs
+    assert responder.iterable is None
+    assert responder.iterator is None
+
+
+def test_responder_iter_exception_closes_returned_iterable():
+    """Failure constructing the iterator releases the application result."""
+    # Arrange: return a closeable iterable whose __iter__ fails.
+    error = RuntimeError("iterator construction failed")
+    iterable = _IterFailingIterable(error)
+
+    def app(environ, start_response):
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return iterable
+
+    responder, remoter = _make_app_responder(app)
+
+    # Act: invoke the application and request its iterator.
+    responder.service()
+
+    # Assert: abort retains the cause and closes the returned iterable once.
+    assert responder.closed
+    assert responder.errored
+    assert responder.error is error
+    assert not responder.ended
+    assert not remoter.txbs
+    assert iterable.close_count == 1
+    assert responder.iterable is None
+    assert responder.iterator is None
+
+
+def test_responder_next_exception_closes_returned_iterable():
+    """Failure advancing the iterator terminates response production."""
+    # Arrange: make the first iterator advancement fail.
+    error = RuntimeError("iterator advancement failed")
+    responder, remoter, iterable, iterator = _make_tracked_responder(
+        [], terminal_error=error)
+
+    # Act: advance response production once.
+    responder.service()
+
+    # Assert: the first cause is retained and application cleanup runs once.
+    assert responder.closed
+    assert responder.errored
+    assert responder.error is error
+    assert not responder.ended
+    assert not remoter.txbs
+    assert iterable.close_count == 1
+    assert iterator.close_count == 0
+    assert responder.iterable is None
+    assert responder.iterator is None
+
+
+def test_responder_application_http_error_before_headers_is_response():
+    """Application HTTPError before commitment remains a valid response."""
+    # Arrange: raise a renderable HTTP error before returning an iterable.
+    error = httping.HTTPError(status=404, detail="not here")
+
+    def app(environ, start_response):
+        raise error
+
+    responder, remoter = _make_app_responder(app)
+
+    # Act: let HIO render the pre-commit application failure.
+    responder.service()
+
+    # Assert: the rendered error is a successful finite HTTP response.
+    assert responder.ended
+    assert not responder.closed
+    assert not responder.errored
+    assert responder.error is None
+    assert b"HTTP/1.1 404 Not Found" in remoter.txbs
+    assert b"not here" in remoter.txbs
+    assert responder.iterable is None
+    assert responder.iterator is None
+
+
+def test_responder_iterator_http_error_before_headers_closes_iterable():
+    """Pre-commit iterator HTTPError renders after application cleanup."""
+    # Arrange: return an iterable that raises before any response bytes are sent.
+    error = httping.HTTPError(status=503, detail="try later")
+    responder, remoter, iterable, iterator = _make_tracked_responder(
+        [], terminal_error=error)
+
+    # Act: advance the iterator and render its HTTP error.
+    responder.service()
+
+    # Assert: cleanup precedes a successful finite error response.
+    assert responder.ended
+    assert not responder.closed
+    assert not responder.errored
+    assert responder.error is None
+    assert b"HTTP/1.1 503 Service Unavailable" in remoter.txbs
+    assert b"try later" in remoter.txbs
+    assert iterable.close_count == 1
+    assert iterator.close_count == 0
+    assert responder.iterable is None
+    assert responder.iterator is None
+
+
+def test_responder_http_error_after_headers_is_failure():
+    """HTTPError after response commitment cannot become a second response."""
+    # Arrange: emit one body chunk before raising a later HTTP error.
+    error = httping.HTTPError(status=503, detail="too late")
+    responder, remoter, iterable, iterator = _make_tracked_responder(
+        [b"body"], terminal_error=error)
+    responder.service()
+    before = bytes(remoter.txbs)
+
+    # Act: advance into the post-commit HTTP error.
+    responder.service()
+
+    # Assert: production aborts without changing the committed response bytes.
+    assert responder.closed
+    assert responder.errored
+    assert responder.error is error
+    assert not responder.ended
+    assert bytes(remoter.txbs) == before
+    assert not remoter.txbs.endswith(b"0\r\n\r\n")
+    assert iterable.close_count == 1
+    assert iterator.close_count == 0
+    assert responder.iterable is None
+    assert responder.iterator is None
 
 
 def test_responder_closes_returned_iterable_after_normal_exhaustion():
