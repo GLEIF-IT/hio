@@ -417,8 +417,14 @@ class Server(Acceptor):
         """
         Service transmits for all remoters in .ixes
         """
-        for rm in self.ixes.values():  # remoter
-            rm.serviceSends()
+        for ca, rm in list(self.ixes.items()):
+            try:
+                rm.serviceSends()
+            except OSError as ex:
+                if not rm.cutoff:
+                    raise  # preserve failures that have not closed the connection
+                logger.error("Closing incoming socket on %s.\n%s\n", ca, ex)
+                self.removeIx(ca=ca)
 
 
     def service(self):

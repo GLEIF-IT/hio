@@ -831,9 +831,16 @@ class Server():
         if ca in self.reps:
             self.reps[ca].close()  # this signals response handler
             if ca in self.servant.ixes:
-                self.servant.ixes[ca].serviceSends()  #  send final bytes to socket
+                ix = self.servant.ixes[ca]
+                try:
+                    ix.serviceSends()  # send final bytes to socket
+                except OSError:
+                    if not ix.cutoff:
+                        raise  # only suppress an already-terminal connection failure
             del self.reps[ca]
-        self.servant.removeIx(ca)
+        # The TCP receive loop may already have removed a failed connection.
+        if ca in self.servant.ixes:
+            self.servant.removeIx(ca)
 
 
     def serviceConnects(self):
@@ -861,7 +868,12 @@ class Server():
         """
         for ca, requestant in list(self.reqs.items()):
             ix = self.servant.ixes.get(ca)
-            if ix is not None and ix.cutoff:
+            if ix is None:
+                # Terminal transport errors remove TCP state before this phase.
+                # Retire the parser and producer without dispatching more work.
+                self.closeConnection(ca)
+                continue
+            if ix.cutoff:
                 # Receive may discover EOF after serviceConnects this recurrence.
                 requestant.close()
 
@@ -910,7 +922,7 @@ class Server():
         Service pending responders
         """
         for ca, responder in list(self.reps.items()):
-            if responder.closed:
+            if ca not in self.servant.ixes or responder.closed:
                 self.closeConnection(ca)
                 continue
 

@@ -2,6 +2,8 @@
 """
 Tests for http serving module
 """
+from contextlib import contextmanager
+
 import logging
 import sys
 import os
@@ -926,6 +928,7 @@ def test_wsgi_server_reuse_resets_request_scoped_response_state():
                       b"Host: localhost\r\n\r\n"),
         remoter=remoter)
     server = serving.Server(app=app, port=6101)
+    server.servant.ixes[ca] = remoter
     server.reqs[ca] = requestant
     server.reps[ca] = responder
 
@@ -1234,6 +1237,104 @@ def test_server_client_doers():
     assert response['body'] == (b'Hello World!')
     assert response['status'] == 200
     """End Test """
+
+
+@contextmanager
+def open_https_server(app, tymth):
+    """Open a verified TLS server on an OS-assigned loopback port."""
+    # Bind at the TCP layer: HTTP Server replaces port zero with 443.
+    with tcp.openServer(
+            cls=tcp.ServerTls, ha=('127.0.0.1', 0), tymth=tymth,
+            keypath=os.path.join(certdirpath, 'server_key.pem'),
+            certpath=os.path.join(certdirpath, 'server_cert.pem'),
+            cafilepath=os.path.join(certdirpath, 'client.pem')) as servant:
+        assert servant.opened
+        assert servant.ha[1] != 0
+        servant.eha = servant.ha  # advertise the OS-assigned port
+        server = serving.Server(app=app, servant=servant, ha=servant.ha)
+        try:
+            yield server
+        finally:
+            server.close()
+
+
+def open_https_client(server, tymth):
+    """Return a context manager for a verified TLS client of this server."""
+    return http.openClient(
+        path=f'https://localhost:{server.servant.ha[1]}/',
+        tymth=tymth, certedhost='localhost',
+        keypath=os.path.join(certdirpath, 'client_key.pem'),
+        certpath=os.path.join(certdirpath, 'client_cert.pem'),
+        cafilepath=os.path.join(certdirpath, 'server.pem'))
+
+
+@pytest.mark.parametrize("completed", [False, True], ids=["mid-response", "after-response"])
+def test_tls_abrupt_disconnect_cleans_http_state(completed):
+    """Retire a vanished TLS peer, then serve a new client on the same server."""
+    tymist = tyming.Tymist()
+    tymth = tymist.tymen()
+    closed = []
+
+    def app(environ, start_response):
+        # Keep the first response open unless testing a completed response.
+        # The recovery request always finishes; finally records producer cleanup.
+        start_response('200 OK', [('Content-Type', 'text/plain')])
+        try:
+            yield b'pending'
+            if completed or environ['PATH_INFO'] == '/healthy':
+                return
+            while True:
+                yield b'pending'
+        finally:
+            closed.append(True)
+
+    # 1. Establish a real TLS connection and start producing the response.
+    with open_https_server(app, tymth) as server:
+        with open_https_client(server, tymth) as client:
+            client.request(method='GET', path='/')
+            deadline = time.monotonic() + 3
+            while not server.reps and time.monotonic() < deadline:
+                client.service()
+                server.service()
+                time.sleep(0.001)
+            assert len(server.reps) == 1
+            responder = next(iter(server.reps.values()))
+            assert not responder.ended
+            # Exercise both an active producer and an idle persistent connection.
+            if completed:
+                server.service()
+                assert responder.ended
+            ca = next(iter(server.servant.ixes))
+
+            # 2. Drop the peer without TLS close_notify, then let the server
+            # discover the loss and retire its transport and HTTP state.
+            client.connector.cs.close()
+            deadline = time.monotonic() + 3
+            while (server.reqs or server.reps or server.servant.ixes) and time.monotonic() < deadline:
+                server.service()
+                time.sleep(0.001)
+            # 3. Cleanup must remove every registry entry, close the producer
+            # exactly once, and mark only an unfinished response as failed.
+            assert not server.servant.ixes
+            assert not server.reqs
+            assert not server.reps
+            assert responder.closed
+            assert responder.errored is (not completed)
+            assert closed == [True]
+            server.closeConnection(ca)  # repeated cleanup is harmless
+
+        # 4. A fresh TLS client must still receive a complete response from
+        # this same server: cleanup must not terminate its service loop.
+        with open_https_client(server, tymth) as client:
+            client.request(method='GET', path='/healthy')
+            deadline = time.monotonic() + 3
+            while not client.responses and time.monotonic() < deadline:
+                server.service()
+                client.service()
+                time.sleep(0.001)
+            assert client.responses[0]['status'] == 200
+            assert client.responses[0]['body'] == b'pending'
+            assert closed == [True, True]
 
 
 if __name__ == '__main__':

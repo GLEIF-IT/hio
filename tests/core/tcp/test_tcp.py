@@ -2819,3 +2819,38 @@ def test_remoter_retains_terminal_receive_failure():
 
 if __name__ == "__main__":
     test_tcp_tls_server_with_client_abort_handshake()
+
+
+@pytest.mark.parametrize("cutoff", [False, True])
+def test_server_send_error_cleanup_requires_cutoff(cutoff):
+    """Remove cutoff connections after send errors and continue serving peers.
+
+    Propagate errors from connections that have not reported cutoff.
+    """
+    server = serving.Server()
+    # An instance includes cutoff and other attributes created by __init__.
+    remoter_spec = serving.Remoter(ha=server.ha, ca=None, cs=None)
+    # Two client connections, represented by server-side Remoters:
+    # client 1 raises during sending; client 2 can be serviced normally.
+    failed = Mock(spec_set=remoter_spec, cutoff=cutoff)
+    failed.serviceSends.side_effect = ssl.SSLEOFError(ssl.SSL_ERROR_EOF, "abrupt EOF")
+    healthy = Mock(spec_set=remoter_spec)
+    ca = ("127.0.0.1", 12345)
+    other = ("127.0.0.1", 12346)
+    # Service client 1 first so its failure tests whether client 2 is reached.
+    server.ixes.update({ca: failed, other: healthy})
+    if cutoff:
+        # Client 1 has reported cutoff: close/remove it, contain its error,
+        # and continue to client 2 within this same send-loop call.
+        server.serviceSendsAllIx()
+        assert ca not in server.ixes
+        failed.close.assert_called_once_with()
+        healthy.serviceSends.assert_called_once_with()
+    else:
+        # Client 1 has not reported cutoff: propagate its error without
+        # closing/removing it. The loop exits before servicing client 2.
+        with pytest.raises(ssl.SSLEOFError):
+            server.serviceSendsAllIx()
+        assert server.ixes[ca] is failed
+        failed.close.assert_not_called()
+        healthy.serviceSends.assert_not_called()
