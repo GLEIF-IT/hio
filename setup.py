@@ -39,7 +39,7 @@ from setuptools import setup
 
 setup(
     name='gleif_hio',
-    version='0.6.20',  # also change in src/hio/__init__.py
+    version='0.6.21',  # also change in src/hio/__init__.py
     license='Apache Software License 2.0',
     description='GLEIF-maintained HIO release for KERI infrastructure',
     long_description=("GLEIF-maintained release of the HIO hierarchical "
