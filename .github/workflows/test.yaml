@@ -14,13 +14,16 @@ jobs:
       fail-fast: false
       matrix:
         os: [ macos-latest, ubuntu-latest, windows-latest ]
-        python-version: [ '3.12.2', '3.13' ]
+        python-version: [ '3.12.2', '3.12.15', '3.13.17' ]
+        constraints: [ security-minimum, security-target ]
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Bootstrap patched pip
+        run: python -m pip install "pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
       - name: Install dependencies (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -28,18 +31,18 @@ jobs:
           sudo mkdir -p /usr/local/var/hio/logs
           sudo mkdir -p /usr/local/var/hio/wirelogs
           sudo chown -R $USER /usr/local/var/hio
-          python -m pip install --upgrade pip
-          pip install pytest
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          python -m pip install "setuptools>=83" "wheel>=0.46.2" pytest
+          python -m pip install -c requirements/${{ matrix.constraints }}.txt .
+          python -m pip check
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
         run: |
           mkdir -Force -Path "C:usr\local\var\hio\test"
           mkdir -Force -Path "C:usr\local\var\hio\logs"
           mkdir -Force -Path "C:usr\local\var\hio\wirelogs"
-          python -m pip install --upgrade pip
-          pip install pytest
-          if (Test-Path -Path "requirements.txt") { pip install -r requirements.txt }
+          python -m pip install "setuptools>=83" "wheel>=0.46.2" pytest
+          python -m pip install -c requirements/${{ matrix.constraints }}.txt .
+          python -m pip check
       - name: Run hio tests
         run: |
-          pytest
+          python -m pytest
