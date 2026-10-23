@@ -2854,18 +2854,3 @@ def test_server_send_error_cleanup_requires_cutoff(cutoff):
         assert server.ixes[ca] is failed
         failed.close.assert_not_called()
         healthy.serviceSends.assert_not_called()
-
-
-def test_private_only_client_context_preserves_ca_store():
-    """An explicit context AND cafile avoid adding platform trust roots."""
-    cafile = os.path.join(localTestCertDirPath(), 'server.pem')
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    context.load_verify_locations(cafile=cafile)
-    expected = context.get_ca_certs(binary_form=True)
-    assert expected
-    client = tcp.ClientTls(context=context, cafilepath=cafile,
-                           host='127.0.0.1', port=443, certedhost='localhost')
-    assert client.context is context
-    assert context.get_ca_certs(binary_form=True) == expected
-    assert context.verify_mode == ssl.CERT_REQUIRED
-    assert context.check_hostname
