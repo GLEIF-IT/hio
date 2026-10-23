@@ -1,0 +1,4 @@
+cbor2==5.9.0
+msgpack==1.2.1
+multidict==6.9.1
+lmdb==1.6.2

@@ -3,6 +3,6 @@
 hio package
 """
 
-__version__ = '0.6.21'  # also change in setup.py
+__version__ = '0.6.22'  # also change in setup.py
 
 from .hioing import Mixin, HioError, ValidationError, VersionError

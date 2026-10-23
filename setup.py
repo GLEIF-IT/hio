@@ -39,7 +39,7 @@ from setuptools import setup
 
 setup(
     name='gleif_hio',
-    version='0.6.21',  # also change in src/hio/__init__.py
+    version='0.6.22',  # also change in src/hio/__init__.py
     license='Apache Software License 2.0',
     description='GLEIF-maintained HIO release for KERI infrastructure',
     long_description=("GLEIF-maintained release of the HIO hierarchical "
@@ -87,9 +87,9 @@ setup(
     python_requires='>=3.12.2',
     install_requires=[
         'lmdb>=1.6.2',
-        'msgpack>=1.1.0',
-        'cbor2>=5.6.5',
-        'multidict>=6.1.0,<7.1',
+        'msgpack>=1.2.1',
+        'cbor2>=5.9.0',
+        'multidict>=6.9.1,<7.1',
         'falcon>=4.0.2',
         'ordered-set>=4.1.0',
 
